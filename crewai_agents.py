@@ -147,7 +147,8 @@ class DailyReport:
 # ---------------------------------------------------------------------------
 
 class VideoDownloaderAgent:
-    """Downloads Tamil serial episodes via HLS stream interception."""
+    """Downloads Tamil serial episodes using yt-dlp (primary) with
+    selenium-wire HLS interception as fallback."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -156,9 +157,47 @@ class VideoDownloaderAgent:
     def _build_url(self, base_url: str, date_str: str) -> str:
         return base_url.rstrip("/") + "/" + date_str + "/"
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=5, max=30))
+    # --- Method 1: yt-dlp (reliable, handles most video sites) ---
+
+    def _download_with_ytdlp(self, page_url: str, output_path: str) -> bool:
+        """Use yt-dlp to extract and download video from page URL."""
+        logger.info(f"[yt-dlp] Attempting download from: {page_url}")
+        cmd = [
+            "yt-dlp",
+            "--no-check-certificates",
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "--referer", page_url,
+            "-f", "best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "-o", output_path,
+            "--no-playlist",
+            "--socket-timeout", "30",
+            "--retries", "3",
+            page_url,
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600
+            )
+            if result.returncode == 0 and Path(output_path).exists():
+                size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+                logger.info(f"[yt-dlp] Download complete: {output_path} ({size_mb:.1f} MB)")
+                return True
+            logger.warning(f"[yt-dlp] Failed (rc={result.returncode}): {result.stderr[:300]}")
+            return False
+        except subprocess.TimeoutExpired:
+            logger.warning("[yt-dlp] Timeout after 600s")
+            return False
+        except FileNotFoundError:
+            logger.warning("[yt-dlp] yt-dlp binary not found")
+            return False
+
+    # --- Method 2: Selenium-wire HLS interception (fallback) ---
+
     def _try_intercept_m3u8(self, page_url: str) -> Optional[str]:
-        logger.info(f"Intercepting HLS from: {page_url}")
+        logger.info(f"[selenium-wire] Intercepting HLS from: {page_url}")
         try:
             from seleniumwire import webdriver as sw_webdriver
             from selenium.webdriver.chrome.options import Options
@@ -167,8 +206,7 @@ class VideoDownloaderAgent:
             from selenium.webdriver.support import expected_conditions as EC
 
             chrome_options = Options()
-            if os.getenv("HEADLESS", "true").lower() == "true":
-                chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--disable-gpu")
@@ -178,78 +216,163 @@ class VideoDownloaderAgent:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             )
             sw_options = {"disable_encoding": True}
-            driver = sw_webdriver.Chrome(options=chrome_options, seleniumwire_options=sw_options)
+            driver = sw_webdriver.Chrome(
+                options=chrome_options, seleniumwire_options=sw_options
+            )
             driver.set_page_load_timeout(60)
             try:
                 driver.get(page_url)
-                time.sleep(8)
-                try:
-                    play_btn = WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable(
-                            (By.CSS_SELECTOR, ".jw-icon-display, .vjs-big-play-button, video")
+                time.sleep(10)
+                # Try clicking play button
+                for sel in [".jw-icon-display", ".vjs-big-play-button",
+                            "video", ".play-btn", "#player"]:
+                    try:
+                        btn = WebDriverWait(driver, 5).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
                         )
-                    )
-                    play_btn.click()
-                    time.sleep(5)
-                except Exception:
-                    pass
+                        btn.click()
+                        time.sleep(3)
+                        break
+                    except Exception:
+                        continue
+                # Try server buttons
                 for server in self.servers:
                     try:
-                        btn = driver.find_element(By.XPATH, f"//a[contains(text(),'{server}')]")
+                        btn = driver.find_element(
+                            By.XPATH, f"//a[contains(text(),'{server}')]"
+                        )
                         btn.click()
-                        time.sleep(5)
+                        time.sleep(6)
                     except Exception:
                         continue
                     for req in driver.requests:
                         if req.response and ".m3u8" in req.url:
-                            logger.info(f"Found m3u8: {req.url}")
+                            logger.info(f"[selenium-wire] Found m3u8: {req.url}")
                             return req.url
+                # Final sweep of all requests
                 for req in driver.requests:
                     if req.response and ".m3u8" in req.url:
-                        logger.info(f"Found m3u8: {req.url}")
+                        logger.info(f"[selenium-wire] Found m3u8: {req.url}")
                         return req.url
-                logger.warning("No m3u8 URL found in network requests.")
+                logger.warning("[selenium-wire] No m3u8 URL found")
                 return None
             finally:
                 driver.quit()
-        except ImportError:
-            logger.error("selenium-wire not installed. Skipping video download.")
+        except Exception as e:
+            logger.warning(f"[selenium-wire] Failed: {e}")
             return None
 
     def _download_with_ffmpeg(self, m3u8_url: str, output_path: str) -> bool:
-        logger.info(f"Downloading HLS to: {output_path}")
+        logger.info(f"[ffmpeg] Downloading HLS to: {output_path}")
         cmd = [
-            "ffmpeg", "-y", "-i", m3u8_url,
-            "-c", "copy", "-bsf:a", "aac_adtstoasc", output_path,
+            "ffmpeg", "-y",
+            "-headers", "User-Agent: Mozilla/5.0\r\n",
+            "-i", m3u8_url,
+            "-c", "copy", "-bsf:a", "aac_adtstoasc",
+            output_path,
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             if result.returncode == 0 and Path(output_path).exists():
-                logger.info(f"Download complete: {output_path}")
+                size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+                logger.info(f"[ffmpeg] Done: {output_path} ({size_mb:.1f} MB)")
                 return True
-            logger.error(f"FFmpeg failed: {result.stderr[:500]}")
+            logger.error(f"[ffmpeg] Failed: {result.stderr[:500]}")
             return False
         except subprocess.TimeoutExpired:
-            logger.error("FFmpeg timeout after 300s")
+            logger.error("[ffmpeg] Timeout after 600s")
             return False
         except FileNotFoundError:
-            logger.error("FFmpeg not found. Install ffmpeg.")
+            logger.error("[ffmpeg] ffmpeg not found")
             return False
+
+    # --- Method 3: Direct page scraping for embedded m3u8/mp4 URLs ---
+
+    def _scrape_video_url(self, page_url: str) -> Optional[str]:
+        """Scrape the page HTML for embedded video/m3u8/mp4 URLs."""
+        logger.info(f"[scrape] Looking for video URLs in: {page_url}")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+        }
+        try:
+            resp = requests.get(page_url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            html = resp.text
+            # Look for m3u8 URLs in page source
+            m3u8_urls = re.findall(
+                r'https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*', html, re.I
+            )
+            if m3u8_urls:
+                logger.info(f"[scrape] Found m3u8: {m3u8_urls[0]}")
+                return m3u8_urls[0]
+            # Look for mp4 URLs
+            mp4_urls = re.findall(
+                r'https?://[^\s\'"<>]+\.mp4[^\s\'"<>]*', html, re.I
+            )
+            if mp4_urls:
+                logger.info(f"[scrape] Found mp4: {mp4_urls[0]}")
+                return mp4_urls[0]
+            # Look for iframe sources (embedded players)
+            soup = BeautifulSoup(html, "lxml")
+            for iframe in soup.find_all("iframe"):
+                src = iframe.get("src", "")
+                if src and ("player" in src.lower() or "embed" in src.lower()):
+                    logger.info(f"[scrape] Found player iframe: {src}")
+                    # Fetch iframe page and look for video URLs
+                    try:
+                        iframe_resp = requests.get(src, headers=headers, timeout=15)
+                        iframe_m3u8 = re.findall(
+                            r'https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*',
+                            iframe_resp.text, re.I
+                        )
+                        if iframe_m3u8:
+                            logger.info(f"[scrape] Found m3u8 in iframe: {iframe_m3u8[0]}")
+                            return iframe_m3u8[0]
+                    except Exception:
+                        pass
+            return None
+        except Exception as e:
+            logger.warning(f"[scrape] Failed: {e}")
+            return None
+
+    # --- Main download pipeline ---
 
     def download_serial(self, serial_cfg: dict, date_str: str) -> VideoResult:
         name = serial_cfg["name"]
         page_url = self._build_url(serial_cfg["base_url"], date_str)
-        logger.info(f"Processing serial: {name} for {date_str}")
+        filename = f"{name}_{date_str}.mp4".replace(" ", "_")
+        output_path = str(DOWNLOAD_DIR / filename)
+        logger.info(f"Processing serial: {name} for {date_str} -> {page_url}")
+
         try:
-            m3u8_url = self._try_intercept_m3u8(page_url)
-            if not m3u8_url:
-                return VideoResult(name, date_str, "failed", error="No m3u8 stream found")
-            filename = f"{name}_{date_str}.mp4".replace(" ", "_")
-            output_path = str(DOWNLOAD_DIR / filename)
-            if self._download_with_ffmpeg(m3u8_url, output_path):
+            # Strategy 1: yt-dlp (handles most sites automatically)
+            if self._download_with_ytdlp(page_url, output_path):
                 return VideoResult(name, date_str, "success", file_path=output_path)
-            else:
+
+            # Strategy 2: Scrape page for direct video/m3u8 URLs
+            video_url = self._scrape_video_url(page_url)
+            if video_url:
+                if video_url.endswith(".m3u8") or ".m3u8" in video_url:
+                    if self._download_with_ffmpeg(video_url, output_path):
+                        return VideoResult(name, date_str, "success", file_path=output_path)
+                elif self._download_with_ytdlp(video_url, output_path):
+                    return VideoResult(name, date_str, "success", file_path=output_path)
+
+            # Strategy 3: Selenium-wire HLS interception (heavy, last resort)
+            m3u8_url = self._try_intercept_m3u8(page_url)
+            if m3u8_url:
+                if self._download_with_ffmpeg(m3u8_url, output_path):
+                    return VideoResult(name, date_str, "success", file_path=output_path)
                 return VideoResult(name, date_str, "failed", error="FFmpeg conversion failed")
+
+            return VideoResult(
+                name, date_str, "failed",
+                error="All download methods failed (yt-dlp, scrape, selenium-wire)"
+            )
+
         except Exception as e:
             logger.exception(f"Video download error for {name}")
             return VideoResult(name, date_str, "failed", error=str(e)[:200])
@@ -332,35 +455,19 @@ class FinancialScraperAgent:
         try:
             html = self._fetch_page(url)
             soup = BeautifulSoup(html, "lxml")
+            text = soup.get_text(" ", strip=True)
             data = {}
-            # IBJA shows h3 tags with rates like "15033 (1 Gram)" under purity labels
-            headings = soup.find_all("h3")
-            purity_999 = False
-            purity_916 = False
-            for h3 in headings:
-                text = h3.get_text(strip=True)
-                # Look for "999 Purity" label in preceding elements
-                prev = h3.find_previous(string=re.compile(r"999\s*Purity", re.I))
-                prev_916 = h3.find_previous(string=re.compile(r"916\s*Purity", re.I))
-                rate_match = re.search(r"([\d,]+)\s*\(1\s*Gram\)", text, re.I)
-                if rate_match:
-                    rate = rate_match.group(1)
-                    # Determine which purity this belongs to by checking context
-                    if not data.get("gold_24k"):
-                        data["gold_24k"] = rate
-                    elif not data.get("gold_22k"):
-                        # Skip 995 purity (second h3), grab 916 (third h3)
-                        continue
-            # Fallback: extract all per-gram rates from page text
-            if not data.get("gold_24k") or not data.get("gold_22k"):
-                text = soup.get_text(" ", strip=True)
-                # Pattern: "999 Purity ### NNNNN (1 Gram)"
-                all_rates = re.findall(r"(\d{3})\s*Purity\s*###?\s*([\d,]+)\s*\(1\s*Gram\)", text, re.I)
-                for purity, rate in all_rates:
-                    if purity == "999" and not data.get("gold_24k"):
-                        data["gold_24k"] = rate
-                    elif purity == "916" and not data.get("gold_22k"):
-                        data["gold_22k"] = rate
+            # Pattern matches: "999 Purity ### 15033 (1 Gram)"
+            # The page has multiple ### headings per purity
+            all_rates = re.findall(
+                r"(\d{3})\s*Purity\s*#{1,3}\s*([\d,]+)\s*\(1\s*Gram\)",
+                text, re.I
+            )
+            for purity, rate in all_rates:
+                if purity == "999" and not data.get("gold_24k"):
+                    data["gold_24k"] = rate
+                elif purity == "916" and not data.get("gold_22k"):
+                    data["gold_22k"] = rate
             if data:
                 logger.info(f"IBJA gold rates: {data}")
             return data
@@ -414,37 +521,27 @@ class FinancialScraperAgent:
 
 class DeliveryAgent:
     """
-    Sends messages to different WhatsApp numbers based on category.
+    Sends messages to different WhatsApp numbers via Twilio API.
 
     Config structure (config.yaml):
         whatsapp_targets:
           videos:
             - phone: "+16473386458"
               label: "Sn (primary)"
-            - phone: "+19055551234"
-              label: "Family group"
           financial:
             - phone: "+16473386458"
               label: "Sn (primary)"
           consolidated_report:
             - phone: "+16473386458"
               label: "Sn (primary)"
-
-    Categories:
-      - videos:              receives the .mp4 files with captions
-      - financial:           receives the gold/forex text summary
-      - consolidated_report: receives the full daily report
     """
 
-    # The three supported delivery categories
     CAT_VIDEOS = "videos"
     CAT_FINANCIAL = "financial"
     CAT_REPORT = "consolidated_report"
 
     def __init__(self, config: dict):
         self.targets = config.get("whatsapp_targets", {})
-        # Backwards compatibility: if old single "phone" key exists and no
-        # whatsapp_targets configured, map it to all three categories.
         if not self.targets:
             fallback = os.getenv("PHONE", config.get("phone", ""))
             if fallback:
@@ -454,45 +551,58 @@ class DeliveryAgent:
                     self.CAT_FINANCIAL: list(entry),
                     self.CAT_REPORT: list(entry),
                 }
+        self._twilio_sid = os.getenv("TWILIO_ACCOUNT_SID", "")
+        self._twilio_token = os.getenv("TWILIO_AUTH_TOKEN", "")
+        self._twilio_from = os.getenv(
+            "TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886"
+        )
+
+    def _get_twilio_client(self):
+        if not self._twilio_sid or not self._twilio_token:
+            logger.error("Twilio credentials not set. Cannot deliver.")
+            return None
+        try:
+            from twilio.rest import Client
+            return Client(self._twilio_sid, self._twilio_token)
+        except Exception as e:
+            logger.error(f"Twilio client init failed: {e}")
+            return None
 
     def _get_phones(self, category: str) -> list:
-        """Return list of {phone, label} dicts for a category."""
         return self.targets.get(category, [])
 
     def _send_text_to(self, phone: str, message: str) -> bool:
         if not phone:
             return False
+        client = self._get_twilio_client()
+        if not client:
+            return False
         try:
-            import pywhatkit as kit
-            now = datetime.now()
-            h = now.hour
-            m = now.minute + 2
-            if m >= 60:
-                h += 1
-                m -= 60
-            kit.sendwhatmsg(phone, message, h, m, wait_time=15)
-            logger.info(f"WhatsApp text sent to {phone}")
+            to_addr = phone if phone.startswith("whatsapp:") else f"whatsapp:{phone}"
+            msg = client.messages.create(
+                from_=self._twilio_from,
+                to=to_addr,
+                body=message,
+            )
+            logger.info(f"WhatsApp text sent to {phone}: SID={msg.sid}")
             return True
         except Exception as e:
             logger.error(f"WhatsApp text to {phone} failed: {e}")
             return False
 
     def _send_file_to(self, phone: str, file_path: str, caption: str = "") -> bool:
+        """Send a file via Twilio. Note: Twilio requires publicly accessible URLs
+        for media. For local files, we send a text notification instead."""
         if not phone or not Path(file_path).exists():
             return False
-        try:
-            import pywhatkit as kit
-            kit.sendwhats_image(phone, file_path, caption)
-            logger.info(f"WhatsApp file sent to {phone}: {file_path}")
-            return True
-        except Exception as e:
-            logger.error(f"WhatsApp file to {phone} failed: {e}")
-            return False
+        size_mb = Path(file_path).stat().st_size / (1024 * 1024)
+        msg = f"{caption}\n\nFile: {Path(file_path).name} ({size_mb:.1f} MB)"
+        msg += "\n(File downloaded on server, ready for pickup)"
+        return self._send_text_to(phone, msg)
 
     # --- Public category-based methods ---
 
     def send_videos(self, video_results: list) -> list:
-        """Send each successful video file to all 'videos' category targets."""
         receipts = []
         targets = self._get_phones(self.CAT_VIDEOS)
         if not targets:
@@ -509,15 +619,12 @@ class DeliveryAgent:
                 ok = self._send_file_to(phone, vr.file_path, caption)
                 receipts.append(DeliveryReceipt(
                     category=self.CAT_VIDEOS,
-                    phone=phone,
-                    label=label,
-                    success=ok,
+                    phone=phone, label=label, success=ok,
                     error=None if ok else f"Failed sending {vr.serial_name}",
                 ))
         return receipts
 
     def send_financial(self, financial: FinancialData) -> list:
-        """Send financial summary text to all 'financial' category targets."""
         receipts = []
         targets = self._get_phones(self.CAT_FINANCIAL)
         if not targets:
@@ -531,15 +638,12 @@ class DeliveryAgent:
             ok = self._send_text_to(phone, msg)
             receipts.append(DeliveryReceipt(
                 category=self.CAT_FINANCIAL,
-                phone=phone,
-                label=label,
-                success=ok,
+                phone=phone, label=label, success=ok,
                 error=None if ok else "Send failed",
             ))
         return receipts
 
     def send_consolidated_report(self, report_text: str) -> list:
-        """Send full daily report to all 'consolidated_report' category targets."""
         receipts = []
         targets = self._get_phones(self.CAT_REPORT)
         if not targets:
@@ -552,15 +656,12 @@ class DeliveryAgent:
             ok = self._send_text_to(phone, report_text)
             receipts.append(DeliveryReceipt(
                 category=self.CAT_REPORT,
-                phone=phone,
-                label=label,
-                success=ok,
+                phone=phone, label=label, success=ok,
                 error=None if ok else "Send failed",
             ))
         return receipts
 
     def disable_all(self):
-        """Disable delivery (used by manual-run UI when user unchecks WhatsApp)."""
         self.targets = {}
 
 

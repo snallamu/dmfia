@@ -21,8 +21,8 @@ schedule_utc: "04:00"
 # ---------------------------------------------------------------------------
 whatsapp_targets:
   videos:
-    - phone: "+919600194447"
-      label: "Amma"
+    - phone: "+16473386458"
+      label: "Sn (primary)"
   financial:
     - phone: "+16473386458"
       label: "Sn (primary)"

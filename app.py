@@ -462,7 +462,7 @@ with tab2:
         {"name": "Financial scraper", "role": "BeautifulSoup scraping of gold rates and CAD/INR forex",
          "status": "idle", "last": "04:03:04", "dur": "5s", "tasks": 3, "fail": 0, "color": "var(--amber)", "bg": "var(--amberbg)", "tc": "var(--ambertx)", "deps": ["BeautifulSoup", "Requests", "lxml"]},
         {"name": "Delivery agent", "role": "Multi-target WhatsApp routing via Twilio API",
-         "status": "idle", "last": "04:03:22", "dur": "17s", "tasks": 5, "fail": 0, "color": "var(--blue)", "bg": "var(--bluebg)", "tc": "var(--bluetx)", "deps": ["Twilio", "PyWhatKit"]},
+         "status": "idle", "last": "04:03:22", "dur": "17s", "tasks": 5, "fail": 0, "color": "var(--blue)", "bg": "var(--bluebg)", "tc": "var(--bluetx)", "deps": ["Twilio"]},
         {"name": "WhatsApp bot", "role": "Flask webhook + Gemini intent parser for conversational control",
          "status": "listening", "last": "09:33 PM", "dur": "always-on", "tasks": 3, "fail": 0, "color": "var(--teal)", "bg": "var(--tealbg)", "tc": "var(--tealtx)", "deps": ["Flask", "Gemini API", "Twilio"], "live": True},
     ]

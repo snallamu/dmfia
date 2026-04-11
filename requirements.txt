@@ -5,7 +5,7 @@ selenium-wire==5.1.0
 selenium==4.27.1
 beautifulsoup4==4.12.3
 requests==2.32.3
-pywhatkit==5.4
+yt-dlp>=2024.12.1
 python-dotenv==1.0.1
 openai==1.82.0
 tenacity==9.0.0
