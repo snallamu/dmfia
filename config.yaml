@@ -1,0 +1,39 @@
+serials:
+  - name: Singapenne
+    base_url: https://tamildhool.se/singapenne/
+  - name: Annam
+    base_url: https://tamildhool.se/annam/
+
+gold_sites:
+  - https://ibjarates.com/
+  - https://www.angelone.in/gold-rates-today
+  - https://www.goodreturns.in/gold/
+
+forex_sites:
+  - https://www.remitly.com/ca/en/currency-converter/cad-to-inr-rate
+
+schedule_utc: "04:00"
+
+# ---------------------------------------------------------------------------
+# WhatsApp Delivery Routing
+# Each category routes to its own list of phone numbers.
+# Add/remove entries per category to fan-out messages independently.
+# ---------------------------------------------------------------------------
+whatsapp_targets:
+  videos:
+    - phone: "+919600194447"
+      label: "Amma"
+  financial:
+    - phone: "+16473386458"
+      label: "Sn (primary)"
+  consolidated_report:
+    - phone: "+16473386458"
+      label: "Sn (primary)"
+
+retry:
+  max_attempts: 3
+  backoff_seconds: 10
+
+servers:
+  - server1
+  - server2
