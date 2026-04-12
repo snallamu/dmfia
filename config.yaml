@@ -12,7 +12,7 @@ gold_sites:
 forex_sites:
   - https://www.remitly.com/ca/en/currency-converter/cad-to-inr-rate
 
-schedule_utc: "04:00"
+schedule_utc: "13:30"
 
 # ---------------------------------------------------------------------------
 # WhatsApp Delivery Routing
@@ -23,13 +23,16 @@ whatsapp_targets:
   videos:
     - phone: "+16473386458"
       label: "Sn (primary)"
+    - phone: "+919600194447"
+      label: "Mom"
   financial:
     - phone: "+16473386458"
       label: "Sn (primary)"
+    - phone: "+918220395532"
+      label: "Priya (India)"
   consolidated_report:
     - phone: "+16473386458"
       label: "Sn (primary)"
-
 retry:
   max_attempts: 3
   backoff_seconds: 10
