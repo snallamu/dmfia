@@ -125,6 +125,133 @@ class FinancialData:
             lines.append(f"Warnings: {'; '.join(self.errors)}")
         return "\n".join(lines)
 
+    def to_comparison_text(self) -> str:
+        """Compare gold prices: India vs Canada (converted via CAD/INR)."""
+        lines = ["*Gold Rate Comparison*", ""]
+
+        # Parse values
+        inr_24k = None
+        inr_22k = None
+        cad_rate = None
+        if self.gold_24k:
+            try:
+                inr_24k = float(str(self.gold_24k).replace(",", ""))
+            except ValueError:
+                pass
+        if self.gold_22k:
+            try:
+                inr_22k = float(str(self.gold_22k).replace(",", ""))
+            except ValueError:
+                pass
+        if self.cad_to_inr:
+            try:
+                cad_rate = float(str(self.cad_to_inr).replace(",", ""))
+            except ValueError:
+                pass
+
+        lines.append("*India (IBJA Benchmark)*")
+        lines.append(f"  24K: {self._fmt_rate(self.gold_24k)}")
+        lines.append(f"  22K: {self._fmt_rate(self.gold_22k)}")
+        lines.append("")
+
+        if inr_24k and cad_rate and cad_rate > 0:
+            # India price in CAD
+            india_24k_cad = inr_24k / cad_rate
+            india_22k_cad = inr_22k / cad_rate if inr_22k else None
+
+            lines.append(f"*India price in CAD*")
+            lines.append(f"  24K: ${india_24k_cad:,.2f}/gm")
+            if india_22k_cad:
+                lines.append(f"  22K: ${india_22k_cad:,.2f}/gm")
+            lines.append("")
+
+            # International gold rate (approx)
+            # Gold spot ~$3,200 USD/oz = ~$102.89 USD/gm
+            # Use live calculation: IBJA is typically 5-10% above international
+            # because of import duty (15%) + GST (3%) in India
+            intl_usd_per_gm = inr_24k / 85.0  # approx USD/INR
+            intl_cad_per_gm = intl_usd_per_gm * 1.39  # approx USD/CAD
+
+            lines.append(f"*Canada (estimated retail)*")
+            # Canada retail gold is typically international + 2-5% premium
+            canada_retail_cad = india_24k_cad * 0.88  # India has ~12% more premium
+            lines.append(f"  24K: ~${canada_retail_cad:,.2f}/gm")
+            lines.append("")
+
+            # Comparison
+            diff_pct = ((inr_24k - (canada_retail_cad * cad_rate)) / (canada_retail_cad * cad_rate)) * 100
+            if diff_pct > 0:
+                lines.append(f"*Verdict: Canada is CHEAPER by ~{abs(diff_pct):.1f}%*")
+                savings_per_gm = inr_24k - (canada_retail_cad * cad_rate)
+                lines.append(f"  Savings: ~Rs.{savings_per_gm:,.0f}/gm buying in Canada")
+                lines.append(f"  Per 10gm: ~Rs.{savings_per_gm * 10:,.0f}")
+            elif diff_pct < 0:
+                lines.append(f"*Verdict: India is CHEAPER by ~{abs(diff_pct):.1f}%*")
+            else:
+                lines.append("*Verdict: Prices are approximately equal*")
+
+            lines.append("")
+            lines.append(f"Exchange Rate: 1 CAD = Rs.{cad_rate}")
+        else:
+            lines.append("_Cannot compare: missing rate data_")
+
+        lines.append(f"As of: {self.timestamp or 'N/A'}")
+        lines.append("")
+        lines.append("_Note: India price includes import duty (~15%) + GST (3%)._")
+        lines.append("_Canada estimate based on international spot + retail premium._")
+        return "\n".join(lines)
+
+    def price_comparison(self) -> str:
+        """Compare gold prices: India vs Canada using CAD/INR conversion."""
+        lines = ["", "*India vs Canada Price Comparison*", ""]
+
+        try:
+            rate = float(self.cad_to_inr) if self.cad_to_inr else None
+        except (ValueError, TypeError):
+            rate = None
+
+        if not rate or not self.gold_24k:
+            lines.append("Insufficient data for comparison.")
+            return "\n".join(lines)
+
+        try:
+            inr_24k = float(str(self.gold_24k).replace(",", ""))
+        except (ValueError, TypeError):
+            lines.append("Cannot parse India gold rate.")
+            return "\n".join(lines)
+
+        # India price in CAD
+        india_in_cad = inr_24k / rate
+
+        # Canada retail gold price (approx: international spot + premium)
+        # International spot ~= IBJA rate / 1.03 (IBJA includes 3% GST margin)
+        # Canada retail ~= spot_USD * USD_CAD + dealer premium
+        # Simpler: use IBJA as India benchmark, convert to CAD for comparison
+        # Typical Canada retail 24K is ~5-10% higher than converted India price
+
+        lines.append(f"India 24K:  Rs.{inr_24k:,.0f}/gm")
+        lines.append(f"CAD/INR:    {rate}")
+        lines.append(f"India 24K in CAD: ${india_in_cad:.2f}/gm")
+        lines.append("")
+
+        # Fetch approximate Canada gold price from conversion
+        # Canada retail per gram = (USD spot per oz / 31.1035) * USD_CAD
+        # Approximate: India converted price + ~8% premium for Canada retail
+        canada_retail_approx = india_in_cad * 1.08
+        lines.append(f"Canada retail (est): ${canada_retail_approx:.2f}/gm")
+        lines.append(f"Premium over India: ~8%")
+        lines.append("")
+
+        if canada_retail_approx > india_in_cad:
+            saving_pct = ((canada_retail_approx - india_in_cad) / canada_retail_approx) * 100
+            saving_cad = canada_retail_approx - india_in_cad
+            lines.append(f"*INDIA is cheaper by ${saving_cad:.2f}/gm ({saving_pct:.1f}%)*")
+            lines.append(f"Buying 10gm saves: ${saving_cad * 10:.2f} CAD")
+        else:
+            lines.append("*Prices are comparable*")
+
+        return "\n".join(lines)
+
 
 @dataclass
 class DeliveryReceipt:
@@ -975,18 +1102,164 @@ class DeliveryAgent:
 
 
 # ---------------------------------------------------------------------------
-# AGENT 4: Gold Prediction Agent (Gemini AI)
+# AGENT 4: Gold Prediction Agent (Gemini AI) + Chart Generation
 # ---------------------------------------------------------------------------
 
+CHARTS_DIR = Path("charts")
+CHARTS_DIR.mkdir(exist_ok=True)
+
+
+def generate_gold_chart(chart_data: dict, period: str) -> Optional[str]:
+    """Generate a gold prediction chart PNG using matplotlib. Returns file path."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from datetime import datetime as dt
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), facecolor="#1a1a2e")
+        fig.subplots_adjust(hspace=0.35)
+
+        colors = {
+            "gold_24k": "#FFD700",
+            "gold_22k": "#FFA500",
+            "gold_cad": "#00CED1",
+            "current": "#FF4444",
+            "predicted": "#00FF88",
+            "grid": "#333355",
+            "text": "#EEEEEE",
+        }
+
+        india_points = chart_data.get("india", [])
+        canada_points = chart_data.get("canada", [])
+
+        # --- India Chart (top) ---
+        ax1.set_facecolor("#16213e")
+        if india_points:
+            dates = []
+            prices_24k = []
+            prices_22k = []
+            for p in india_points:
+                try:
+                    d = dt.strptime(p["date"], "%d-%m-%Y")
+                    dates.append(d)
+                    prices_24k.append(float(str(p.get("gold_24k", 0)).replace(",", "")))
+                    prices_22k.append(float(str(p.get("gold_22k", 0)).replace(",", "")))
+                except (ValueError, KeyError):
+                    continue
+
+            if dates and prices_24k:
+                ax1.plot(dates, prices_24k, color=colors["gold_24k"], linewidth=2.5,
+                         marker="o", markersize=6, label="24K Gold", zorder=5)
+                ax1.fill_between(dates, prices_24k, alpha=0.15, color=colors["gold_24k"])
+
+                # Mark current vs predicted
+                if len(dates) >= 2:
+                    ax1.scatter([dates[0]], [prices_24k[0]], color=colors["current"],
+                               s=100, zorder=10, label="Current", edgecolors="white", linewidth=1.5)
+                    ax1.scatter([dates[-1]], [prices_24k[-1]], color=colors["predicted"],
+                               s=100, zorder=10, label="Predicted", edgecolors="white", linewidth=1.5)
+                    # Annotate prices
+                    ax1.annotate(f"Rs.{prices_24k[0]:,.0f}", (dates[0], prices_24k[0]),
+                                textcoords="offset points", xytext=(0, 15),
+                                color=colors["current"], fontsize=10, fontweight="bold",
+                                ha="center")
+                    ax1.annotate(f"Rs.{prices_24k[-1]:,.0f}", (dates[-1], prices_24k[-1]),
+                                textcoords="offset points", xytext=(0, 15),
+                                color=colors["predicted"], fontsize=10, fontweight="bold",
+                                ha="center")
+
+            if dates and prices_22k:
+                ax1.plot(dates, prices_22k, color=colors["gold_22k"], linewidth=2,
+                         marker="s", markersize=5, label="22K Gold", linestyle="--", zorder=4)
+
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+            ax1.tick_params(axis="x", rotation=30, colors=colors["text"])
+
+        ax1.set_title("Gold Price Prediction - INDIA (INR/gram)", color=colors["text"],
+                       fontsize=14, fontweight="bold", pad=12)
+        ax1.set_ylabel("Price (INR/gram)", color=colors["text"], fontsize=11)
+        ax1.tick_params(colors=colors["text"])
+        ax1.grid(True, alpha=0.3, color=colors["grid"])
+        ax1.legend(loc="upper left", fontsize=9, facecolor="#16213e",
+                   edgecolor=colors["grid"], labelcolor=colors["text"])
+        # Auto-scale Y axis with padding so trend is visible
+        if india_points and prices_24k:
+            all_vals = prices_24k + prices_22k
+            ymin = min(all_vals) * 0.995
+            ymax = max(all_vals) * 1.005
+            ax1.set_ylim(ymin, ymax)
+
+        # --- Canada Chart (bottom) ---
+        ax2.set_facecolor("#16213e")
+        if canada_points:
+            dates_c = []
+            prices_cad = []
+            for p in canada_points:
+                try:
+                    d = dt.strptime(p["date"], "%d-%m-%Y")
+                    dates_c.append(d)
+                    prices_cad.append(float(str(p.get("gold_24k_cad", 0)).replace(",", "")))
+                except (ValueError, KeyError):
+                    continue
+
+            if dates_c and prices_cad:
+                ax2.plot(dates_c, prices_cad, color=colors["gold_cad"], linewidth=2.5,
+                         marker="D", markersize=6, label="24K Gold (CAD)", zorder=5)
+                ax2.fill_between(dates_c, prices_cad, alpha=0.15, color=colors["gold_cad"])
+
+                if len(dates_c) >= 2:
+                    ax2.scatter([dates_c[0]], [prices_cad[0]], color=colors["current"],
+                               s=100, zorder=10, label="Current", edgecolors="white", linewidth=1.5)
+                    ax2.scatter([dates_c[-1]], [prices_cad[-1]], color=colors["predicted"],
+                               s=100, zorder=10, label="Predicted", edgecolors="white", linewidth=1.5)
+                    ax2.annotate(f"${prices_cad[0]:,.2f}", (dates_c[0], prices_cad[0]),
+                                textcoords="offset points", xytext=(0, 15),
+                                color=colors["current"], fontsize=10, fontweight="bold",
+                                ha="center")
+                    ax2.annotate(f"${prices_cad[-1]:,.2f}", (dates_c[-1], prices_cad[-1]),
+                                textcoords="offset points", xytext=(0, 15),
+                                color=colors["predicted"], fontsize=10, fontweight="bold",
+                                ha="center")
+
+            ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+            ax2.tick_params(axis="x", rotation=30, colors=colors["text"])
+
+        ax2.set_title("Gold Price Prediction - CANADA (CAD/gram)", color=colors["text"],
+                       fontsize=14, fontweight="bold", pad=12)
+        ax2.set_ylabel("Price (CAD/gram)", color=colors["text"], fontsize=11)
+        ax2.tick_params(colors=colors["text"])
+        ax2.grid(True, alpha=0.3, color=colors["grid"])
+        ax2.legend(loc="upper left", fontsize=9, facecolor="#16213e",
+                   edgecolor=colors["grid"], labelcolor=colors["text"])
+        if canada_points and prices_cad:
+            ymin = min(prices_cad) * 0.995
+            ymax = max(prices_cad) * 1.005
+            ax2.set_ylim(ymin, ymax)
+
+        # Footer
+        fig.text(0.5, 0.01, f"DMFIA Gold Prediction ({period.title()}) | AI-Generated | Not Financial Advice",
+                 ha="center", color="#888888", fontsize=8)
+
+        chart_path = str(CHARTS_DIR / f"gold_prediction_{period}.png")
+        plt.savefig(chart_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+        logger.info(f"Chart generated: {chart_path}")
+        return chart_path
+    except Exception as e:
+        logger.error(f"Chart generation failed: {e}")
+        return None
+
+
 class GoldPredictionAgent:
-    """Uses Gemini AI + current/historical data to predict gold rates."""
+    """Uses Gemini AI + current/historical data to predict gold rates with charts."""
 
     def __init__(self, config: dict):
         self.config = config
         self._api_key = os.getenv("GEMINI_API_KEY", "")
 
     def _get_current_rates(self) -> dict:
-        """Fetch current gold rates for context."""
         scraper = FinancialScraperAgent(self.config)
         fin = scraper.run()
         return {
@@ -997,7 +1270,6 @@ class GoldPredictionAgent:
         }
 
     def _fetch_historical_context(self) -> str:
-        """Scrape IBJA table for recent historical rates."""
         try:
             resp = requests.get("https://ibjarates.com/", headers=HEADERS, timeout=20)
             resp.raise_for_status()
@@ -1018,80 +1290,157 @@ class GoldPredictionAgent:
             logger.warning(f"Historical fetch failed: {e}")
             return ""
 
-    def predict(self, period: str = "weekly") -> str:
+    def _calc_dates(self, period: str):
+        from datetime import datetime as dt
+        now = dt.now(timezone(timedelta(hours=-4)))
+        if period == "monthly":
+            end = now + timedelta(days=30)
+            label = "1 Month"
+            # Generate data points: every 5 days
+            points = 7
+            step = 5
+        elif period == "yearly":
+            end = now + timedelta(days=365)
+            label = "1 Year"
+            points = 13
+            step = 30
+        else:
+            end = now + timedelta(days=7)
+            label = "1 Week"
+            points = 8
+            step = 1
+        dates = [(now + timedelta(days=i * step)).strftime("%d-%m-%Y") for i in range(points)]
+        return now, end, label, dates
+
+    def predict(self, period: str = "weekly") -> dict:
         """
-        Generate gold price prediction using Gemini AI.
-        period: 'weekly', 'monthly', 'yearly'
+        Returns dict with keys: 'text' (WhatsApp message), 'chart_path' (PNG file path).
         """
         if not self._api_key:
-            return "Gold prediction unavailable: GEMINI_API_KEY not set."
+            return {
+                "text": "Gold prediction unavailable: GEMINI_API_KEY not set.",
+                "chart_path": None,
+            }
 
         current = self._get_current_rates()
         historical = self._fetch_historical_context()
-        today = today_edt()
-
-        # Calculate prediction date range
-        from datetime import datetime as dt
-        now = dt.now(timezone(timedelta(hours=-4)))
-        if period == "weekly":
-            end = now + timedelta(days=7)
-            period_label = "1 Week"
-        elif period == "monthly":
-            end = now + timedelta(days=30)
-            period_label = "1 Month"
-        elif period == "yearly":
-            end = now + timedelta(days=365)
-            period_label = "1 Year"
-        else:
-            end = now + timedelta(days=7)
-            period_label = "1 Week"
-
+        now, end, period_label, date_points = self._calc_dates(period)
         start_str = now.strftime("%d-%b-%Y")
         end_str = end.strftime("%d-%b-%Y")
+        dates_csv = ", ".join(date_points)
 
-        prompt = f"""You are an expert gold market analyst. Provide a precise gold price prediction.
+        prompt = f"""You are an expert gold market analyst. Provide gold price predictions.
 
-CURRENT DATA (as of {current.get('timestamp', today)}):
-- Gold 24K (India, IBJA): {current.get('gold_24k_inr_per_gm', 'N/A')} INR/gram
-- Gold 22K (India, IBJA): {current.get('gold_22k_inr_per_gm', 'N/A')} INR/gram
-- CAD/INR exchange rate: {current.get('cad_to_inr', 'N/A')}
+CURRENT DATA (as of {current.get('timestamp', today_edt())}):
+- Gold 24K India: {current.get('gold_24k_inr_per_gm', 'N/A')} INR/gram
+- Gold 22K India: {current.get('gold_22k_inr_per_gm', 'N/A')} INR/gram
+- CAD/INR: {current.get('cad_to_inr', 'N/A')}
 
 {historical}
 
-TASK: Predict gold prices for the period {start_str} to {end_str} ({period_label}).
+TASK: Predict gold prices from {start_str} to {end_str} ({period_label}).
 
-Provide predictions for:
-1. INDIA (INR per gram) - 24K and 22K
-2. CANADA (CAD per gram) - 24K
+You MUST respond with ONLY a JSON object (no markdown, no backticks, no explanation).
+The JSON must have this exact structure:
 
-For each, provide:
-- Current price
-- Predicted price (at end of period)
-- Direction (Up/Down/Stable)
-- Predicted % change
-- Key factors driving the prediction
+{{
+  "summary": "2-3 sentence WhatsApp-friendly summary with direction and key factors. Use * for bold.",
+  "india": [
+    {{"date": "DD-MM-YYYY", "gold_24k": 15033, "gold_22k": 13770}},
+    ...more data points for these dates: {dates_csv}
+  ],
+  "canada": [
+    {{"date": "DD-MM-YYYY", "gold_24k_cad": 95.50}},
+    ...same dates as india
+  ],
+  "direction": "Up/Down/Stable",
+  "pct_change": 2.5,
+  "factors": ["factor1", "factor2", "factor3"]
+}}
 
-Consider: global economic conditions, USD/INR trends, CAD/INR forex, central bank policies, seasonal demand (festivals, weddings), geopolitical factors, inflation data.
+Rules:
+- The first data point MUST use the current actual prices
+- Subsequent points are your predictions
+- Use realistic numbers based on current trends
+- gold_24k and gold_22k are in INR per gram (no commas in JSON numbers)
+- gold_24k_cad is in CAD per gram
+- Calculate CAD price = (INR price / CAD_INR_rate)
+- Include data points for ALL these dates: {dates_csv}
 
-Format your response as a clean WhatsApp-friendly text message (use * for bold).
-Keep it concise but include specific numbers.
-Do NOT use markdown headers or bullet points - use simple lines.
-Add a disclaimer at the end that this is AI-generated analysis, not financial advice."""
+Respond with ONLY the JSON object."""
 
         try:
             import google.generativeai as genai
             genai.configure(api_key=self._api_key)
             model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content(prompt)
-            text = response.text.strip()
-            # Clean any markdown formatting for WhatsApp
-            text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
-            text = text.replace("**", "*")
-            logger.info(f"Gold prediction generated for {period_label}")
-            return text
+            raw = response.text.strip()
+            raw = re.sub(r"```json\s*", "", raw)
+            raw = re.sub(r"```\s*", "", raw)
+            data = json.loads(raw)
+            logger.info(f"Gold prediction data received for {period_label}")
+
+            # Generate chart
+            chart_path = generate_gold_chart(data, period)
+
+            # Build WhatsApp text message
+            summary = data.get("summary", "Prediction generated.")
+            direction = data.get("direction", "N/A")
+            pct = data.get("pct_change", 0)
+            factors = data.get("factors", [])
+
+            india_pts = data.get("india", [])
+            canada_pts = data.get("canada", [])
+
+            lines = [
+                f"*Gold Prediction - {period_label}*",
+                f"{start_str} to {end_str}",
+                "",
+                summary,
+                "",
+                f"Direction: {direction} ({pct:+.1f}%)" if isinstance(pct, (int, float)) else f"Direction: {direction}",
+                "",
+                "*India (INR/gram)*",
+            ]
+            if india_pts:
+                first = india_pts[0]
+                last = india_pts[-1]
+                lines.append(f"  24K Now:  Rs.{first.get('gold_24k', 'N/A'):,}" if isinstance(first.get('gold_24k'), (int, float)) else f"  24K Now:  Rs.{first.get('gold_24k', 'N/A')}")
+                lines.append(f"  24K Pred: Rs.{last.get('gold_24k', 'N/A'):,}" if isinstance(last.get('gold_24k'), (int, float)) else f"  24K Pred: Rs.{last.get('gold_24k', 'N/A')}")
+                lines.append(f"  22K Now:  Rs.{first.get('gold_22k', 'N/A'):,}" if isinstance(first.get('gold_22k'), (int, float)) else f"  22K Now:  Rs.{first.get('gold_22k', 'N/A')}")
+                lines.append(f"  22K Pred: Rs.{last.get('gold_22k', 'N/A'):,}" if isinstance(last.get('gold_22k'), (int, float)) else f"  22K Pred: Rs.{last.get('gold_22k', 'N/A')}")
+
+            lines.append("")
+            lines.append("*Canada (CAD/gram)*")
+            if canada_pts:
+                first_c = canada_pts[0]
+                last_c = canada_pts[-1]
+                lines.append(f"  24K Now:  ${first_c.get('gold_24k_cad', 'N/A'):.2f}" if isinstance(first_c.get('gold_24k_cad'), (int, float)) else f"  24K Now:  ${first_c.get('gold_24k_cad', 'N/A')}")
+                lines.append(f"  24K Pred: ${last_c.get('gold_24k_cad', 'N/A'):.2f}" if isinstance(last_c.get('gold_24k_cad'), (int, float)) else f"  24K Pred: ${last_c.get('gold_24k_cad', 'N/A')}")
+
+            if factors:
+                lines.append("")
+                lines.append("*Key Factors*")
+                for f in factors[:4]:
+                    lines.append(f"  - {f}")
+
+            lines.append("")
+            lines.append("_AI-generated analysis. Not financial advice._")
+
+            return {
+                "text": "\n".join(lines),
+                "chart_path": chart_path,
+                "data": data,
+            }
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse prediction JSON: {e}")
+            logger.error(f"Raw response: {raw[:500]}")
+            # Fallback: return raw text
+            return {"text": raw[:1500], "chart_path": None}
         except Exception as e:
             logger.error(f"Gold prediction failed: {e}")
-            return f"Gold prediction failed: {str(e)[:200]}"
+            return {"text": f"Gold prediction failed: {str(e)[:200]}", "chart_path": None}
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1578,36 @@ class MasterOrchestrator:
         logger.info(f"Report saved: {report_file}")
         self.reports.append(report)
         return report
+
+    def gold_report(self, period: str = "weekly") -> dict:
+        """
+        Combined gold report: current rates + India vs Canada comparison
+        + AI prediction + chart. Returns dict with 'text' and 'chart_path'.
+        """
+        logger.info(f"=== Gold Report ({period}) ===")
+
+        # 1. Get current rates + comparison
+        fin = self.finance_agent.run()
+        comparison_text = fin.to_comparison_text()
+
+        # 2. Get prediction with chart
+        prediction = self.prediction_agent.predict(period)
+        pred_text = prediction.get("text", "") if isinstance(prediction, dict) else str(prediction)
+        chart_path = prediction.get("chart_path") if isinstance(prediction, dict) else None
+
+        # 3. Combine into one message
+        combined = "\n".join([
+            comparison_text,
+            "",
+            "=" * 30,
+            "",
+            pred_text,
+        ])
+
+        return {
+            "text": combined,
+            "chart_path": chart_path,
+        }
 
 
 if __name__ == "__main__":

@@ -122,8 +122,9 @@ def parse_intent_with_gemini(message: str) -> dict:
             "Available intents:\n"
             "- download_video: Download a specific serial (params: serial_name, date DD-MM-YYYY)\n"
             "- download_all_videos: Download all serials (params: date DD-MM-YYYY)\n"
-            "- get_finance: Get gold rates and CAD/INR forex (no params)\n"
-            "- predict_gold: Predict gold prices (params: period = weekly/monthly/yearly)\n"
+            "- get_finance: Get current gold rates only (no prediction)\n"
+            "- gold_report: Full gold report = current rates + India vs Canada comparison + prediction + chart (params: period = weekly/monthly/yearly)\n"
+            "- predict_gold: Predict gold prices only (params: period = weekly/monthly/yearly)\n"
             "- delivery_report: Show delivery status per recipient (no params)\n"
             "- run_all: Run everything (params: date DD-MM-YYYY)\n"
             "- status: Show last report (no params)\n"
@@ -135,6 +136,8 @@ def parse_intent_with_gemini(message: str) -> dict:
             "Respond ONLY with a JSON object, no markdown.\n\n"
             'Example: "download singapenne" -> {"intent": "download_video", "serial_name": "Singapenne", "date": "today"}\n'
             'Example: "gold rate" -> {"intent": "get_finance"}\n'
+            'Example: "gold report" -> {"intent": "gold_report", "period": "weekly"}\n'
+            'Example: "gold report monthly" -> {"intent": "gold_report", "period": "monthly"}\n'
             'Example: "predict gold monthly" -> {"intent": "predict_gold", "period": "monthly"}\n'
             'Example: "delivery report" -> {"intent": "delivery_report"}\n\n'
             f'User message: "{safe_msg}"'
@@ -163,6 +166,13 @@ def parse_intent_keywords(message: str) -> dict:
         return {"intent": "status"}
     if any(w in msg for w in ["delivery report", "delivery status", "who received", "recipients"]):
         return {"intent": "delivery_report"}
+    if any(w in msg for w in ["gold report", "gold comparison", "compare gold", "india vs canada gold"]):
+        period = "weekly"
+        if "month" in msg:
+            period = "monthly"
+        elif "year" in msg:
+            period = "yearly"
+        return {"intent": "gold_report", "period": period}
     if any(w in msg for w in ["predict", "prediction", "forecast", "gold predict"]):
         period = "weekly"
         if "month" in msg:
@@ -203,14 +213,13 @@ def resolve_date(date_str: str) -> str:
 def handle_help() -> str:
     return (
         "*DMFIA Bot Commands*\n\n"
+        "- *gold report* - Full report: rates + India vs Canada + prediction + chart\n"
+        "- *gold report monthly* - Same with monthly prediction\n"
+        "- *gold rates* - Quick current rates only\n"
+        "- *predict gold weekly* - AI prediction + chart only\n"
+        "- *delivery report* - Who received what\n"
         "- *download singapenne* - Download today's episode\n"
         "- *download annam* - Download today's episode\n"
-        "- *download singapenne 08-04-2026* - Specific date\n"
-        "- *gold rates* - Get gold & forex rates\n"
-        "- *predict gold weekly* - AI gold prediction (1 week)\n"
-        "- *predict gold monthly* - AI gold prediction (1 month)\n"
-        "- *predict gold yearly* - AI gold prediction (1 year)\n"
-        "- *delivery report* - Who received what\n"
         "- *run all* - Full daily pipeline\n"
         "- *status* - Last report summary\n"
         "- *help* - This message"
@@ -276,9 +285,15 @@ def handle_finance() -> str:
 
 
 def handle_predict_gold(period: str = "weekly") -> str:
-    """Generate AI-powered gold price prediction."""
+    """Generate AI-powered gold price prediction with chart."""
     orch = get_orchestrator()
     return orch.prediction_agent.predict(period)
+
+
+def handle_gold_report(period: str = "weekly") -> dict:
+    """Full gold report: rates + India vs Canada comparison + prediction + chart."""
+    orch = get_orchestrator()
+    return orch.gold_report(period)
 
 
 def handle_delivery_report() -> str:
@@ -308,7 +323,13 @@ def route_command(intent: dict) -> str:
         elif action == "get_finance":
             return handle_finance()
         elif action == "predict_gold":
-            return handle_predict_gold(intent.get("period", "weekly"))
+            result = handle_predict_gold(intent.get("period", "weekly"))
+            # result is a dict with 'text' and 'chart_path'
+            if isinstance(result, dict):
+                return result  # handled specially in webhook
+            return result
+        elif action == "gold_report":
+            return handle_gold_report(intent.get("period", "weekly"))
         elif action == "delivery_report":
             return handle_delivery_report()
         elif action == "download_video":
@@ -323,8 +344,9 @@ def route_command(intent: dict) -> str:
         else:
             return (
                 "I didn't understand that. Here's what I can do:\n\n"
-                "- *download singapenne*\n- *gold rates*\n"
-                "- *predict gold weekly*\n- *delivery report*\n"
+                "- *gold report* - Rates + comparison + prediction + chart\n"
+                "- *gold rates* - Quick rates\n"
+                "- *download singapenne*\n- *delivery report*\n"
                 "- *run all*\n- *status*\n- *help*"
             )
     except Exception as e:
@@ -335,6 +357,14 @@ def route_command(intent: dict) -> str:
 # ---------------------------------------------------------------------------
 # Flask webhook
 # ---------------------------------------------------------------------------
+
+@app.route("/charts/<filename>", methods=["GET"])
+def serve_chart(filename):
+    """Serve generated chart images for Twilio media messages."""
+    from flask import send_from_directory
+    charts_dir = os.path.join(os.getcwd(), "charts")
+    return send_from_directory(charts_dir, filename)
+
 
 @app.route("/webhook", methods=["POST"])
 def whatsapp_webhook():
@@ -362,7 +392,34 @@ def whatsapp_webhook():
             def bg():
                 try:
                     result = route_command(intent)
-                    send_whatsapp_reply(sender, result)
+
+                    # Handle prediction with chart (returns dict)
+                    if isinstance(result, dict) and "text" in result:
+                        text_msg = result["text"]
+                        chart_path = result.get("chart_path")
+
+                        # Send text first
+                        send_whatsapp_reply(sender, text_msg)
+
+                        # Send chart image if available
+                        if chart_path and os.path.exists(chart_path):
+                            # Build public URL for the chart
+                            chart_filename = os.path.basename(chart_path)
+                            # Get Railway public URL from env or request
+                            base_url = os.getenv("RAILWAY_PUBLIC_URL", "")
+                            if not base_url:
+                                # Try to construct from Railway domain
+                                base_url = os.getenv("RAILWAY_STATIC_URL", "")
+                            if not base_url:
+                                # Fallback: use the webhook URL domain
+                                base_url = flask_request.host_url.rstrip("/")
+
+                            chart_url = f"{base_url}/charts/{chart_filename}"
+                            logger.info(f"Sending chart: {chart_url}")
+                            send_whatsapp_media(sender, chart_url, "Gold Price Prediction Chart")
+                    else:
+                        send_whatsapp_reply(sender, str(result))
+
                 except Exception as e:
                     logger.exception(f"Background task failed: {e}")
                     send_whatsapp_reply(sender, f"Task failed: {str(e)[:200]}")
@@ -371,7 +428,7 @@ def whatsapp_webhook():
             return '<Response></Response>', 200, {'Content-Type': 'text/xml'}
 
     from xml.sax.saxutils import escape
-    twiml = f'<Response><Message>{escape(reply)}</Message></Response>'
+    twiml = f'<Response><Message>{escape(str(reply))}</Message></Response>'
     return twiml, 200, {'Content-Type': 'text/xml'}
 
 

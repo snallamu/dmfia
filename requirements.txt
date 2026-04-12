@@ -13,3 +13,4 @@ flask==3.1.0
 twilio==9.4.0
 google-generativeai==0.8.5
 gunicorn==23.0.0
+matplotlib==3.9.3
