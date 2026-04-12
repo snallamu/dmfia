@@ -1,8 +1,8 @@
 serials:
   - name: Singapenne
-    base_url: https://tamildhool.se/singapenne/
+    url_template: "https://www.tamildhool.tech/sun-tv/sun-tv-serial/singappenne/singapenne-{date}-sun-tv-serial/"
   - name: Annam
-    base_url: https://tamildhool.se/annam/
+    url_template: "https://www.tamildhool.tech/sun-tv/sun-tv-serial/annam/annam-{date}-sun-tv-serial/"
 
 gold_sites:
   - https://ibjarates.com/
@@ -12,7 +12,7 @@ gold_sites:
 forex_sites:
   - https://www.remitly.com/ca/en/currency-converter/cad-to-inr-rate
 
-schedule_utc: "13:30"
+schedule_utc: "04:00"
 
 # ---------------------------------------------------------------------------
 # WhatsApp Delivery Routing
@@ -23,16 +23,13 @@ whatsapp_targets:
   videos:
     - phone: "+16473386458"
       label: "Sn (primary)"
-    - phone: "+919600194447"
-      label: "Mom"
   financial:
     - phone: "+16473386458"
       label: "Sn (primary)"
-    - phone: "+918220395532"
-      label: "Priya (India)"
   consolidated_report:
     - phone: "+16473386458"
       label: "Sn (primary)"
+
 retry:
   max_attempts: 3
   backoff_seconds: 10

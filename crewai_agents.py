@@ -195,8 +195,11 @@ class VideoDownloaderAgent:
         self.config = config
         self.servers = config.get("servers", ["server1", "server2"])
 
-    def _build_url(self, base_url: str, date_str: str) -> str:
-        return base_url.rstrip("/") + "/" + date_str + "/"
+    def _build_url(self, serial_cfg: dict, date_str: str) -> str:
+        if "url_template" in serial_cfg:
+            return serial_cfg["url_template"].replace("{date}", date_str)
+        # Legacy fallback
+        return serial_cfg.get("base_url", "").rstrip("/") + "/" + date_str + "/"
 
     def _download_with_ytdlp(self, page_url: str, output_path: str) -> bool:
         logger.info(f"[yt-dlp] Attempting: {page_url}")
@@ -412,7 +415,7 @@ class VideoDownloaderAgent:
 
     def download_serial(self, serial_cfg: dict, date_str: str) -> VideoResult:
         name = serial_cfg["name"]
-        page_url = self._build_url(serial_cfg["base_url"], date_str)
+        page_url = self._build_url(serial_cfg, date_str)
         filename = f"{name}_{date_str}.mp4".replace(" ", "_")
         output_path = str(DOWNLOAD_DIR / filename)
         logger.info(f"Processing: {name} {date_str} -> {page_url}")
