@@ -123,15 +123,20 @@ def parse_intent_with_gemini(message: str) -> dict:
             "- download_video: Download a specific serial (params: serial_name, date DD-MM-YYYY)\n"
             "- download_all_videos: Download all serials (params: date DD-MM-YYYY)\n"
             "- get_finance: Get gold rates and CAD/INR forex (no params)\n"
+            "- predict_gold: Predict gold prices (params: period = weekly/monthly/yearly)\n"
+            "- delivery_report: Show delivery status per recipient (no params)\n"
             "- run_all: Run everything (params: date DD-MM-YYYY)\n"
             "- status: Show last report (no params)\n"
             "- help: Show help (no params)\n"
             "- unknown: Cannot understand\n\n"
             "Known serials: Singapenne, Annam\n"
             'If no date specified, use "today".\n'
+            'For predict_gold: default period is "weekly". User may say "monthly prediction" or "yearly gold forecast".\n'
             "Respond ONLY with a JSON object, no markdown.\n\n"
             'Example: "download singapenne" -> {"intent": "download_video", "serial_name": "Singapenne", "date": "today"}\n'
-            'Example: "gold rate" -> {"intent": "get_finance"}\n\n'
+            'Example: "gold rate" -> {"intent": "get_finance"}\n'
+            'Example: "predict gold monthly" -> {"intent": "predict_gold", "period": "monthly"}\n'
+            'Example: "delivery report" -> {"intent": "delivery_report"}\n\n'
             f'User message: "{safe_msg}"'
         )
         response = model.generate_content(prompt)
@@ -156,6 +161,17 @@ def parse_intent_keywords(message: str) -> dict:
         return {"intent": "help"}
     if msg in ("status", "last report", "report status"):
         return {"intent": "status"}
+    if any(w in msg for w in ["delivery report", "delivery status", "who received", "recipients"]):
+        return {"intent": "delivery_report"}
+    if any(w in msg for w in ["predict", "prediction", "forecast", "gold predict"]):
+        period = "weekly"
+        if "month" in msg:
+            period = "monthly"
+        elif "year" in msg:
+            period = "yearly"
+        elif "week" in msg:
+            period = "weekly"
+        return {"intent": "predict_gold", "period": period}
     if any(w in msg for w in ["run all", "run everything", "full report", "daily run"]):
         return {"intent": "run_all", "date": date_str}
     if any(w in msg for w in ["gold", "finance", "forex", "cad", "inr", "exchange"]):
@@ -191,6 +207,10 @@ def handle_help() -> str:
         "- *download annam* - Download today's episode\n"
         "- *download singapenne 08-04-2026* - Specific date\n"
         "- *gold rates* - Get gold & forex rates\n"
+        "- *predict gold weekly* - AI gold prediction (1 week)\n"
+        "- *predict gold monthly* - AI gold prediction (1 month)\n"
+        "- *predict gold yearly* - AI gold prediction (1 year)\n"
+        "- *delivery report* - Who received what\n"
         "- *run all* - Full daily pipeline\n"
         "- *status* - Last report summary\n"
         "- *help* - This message"
@@ -255,6 +275,18 @@ def handle_finance() -> str:
     return orch.finance_agent.run().to_text()
 
 
+def handle_predict_gold(period: str = "weekly") -> str:
+    """Generate AI-powered gold price prediction."""
+    orch = get_orchestrator()
+    return orch.prediction_agent.predict(period)
+
+
+def handle_delivery_report() -> str:
+    """Show per-target delivery status."""
+    from crewai_agents import generate_delivery_report
+    return generate_delivery_report()
+
+
 def handle_run_all(date_str: str) -> str:
     date_str = resolve_date(date_str)
     orch = get_orchestrator()
@@ -275,6 +307,10 @@ def route_command(intent: dict) -> str:
             return handle_status()
         elif action == "get_finance":
             return handle_finance()
+        elif action == "predict_gold":
+            return handle_predict_gold(intent.get("period", "weekly"))
+        elif action == "delivery_report":
+            return handle_delivery_report()
         elif action == "download_video":
             serial = intent.get("serial_name", "")
             if not serial:
@@ -288,6 +324,7 @@ def route_command(intent: dict) -> str:
             return (
                 "I didn't understand that. Here's what I can do:\n\n"
                 "- *download singapenne*\n- *gold rates*\n"
+                "- *predict gold weekly*\n- *delivery report*\n"
                 "- *run all*\n- *status*\n- *help*"
             )
     except Exception as e:
@@ -313,7 +350,7 @@ def whatsapp_webhook():
     if not body:
         reply = "Send *help* to see what I can do."
     else:
-        quick_intents = {"help", "status", "unknown"}
+        quick_intents = {"help", "status", "unknown", "delivery_report"}
         intent = parse_intent_with_gemini(body)
         action = intent.get("intent", "unknown")
 

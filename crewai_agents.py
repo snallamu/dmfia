@@ -201,10 +201,51 @@ class VideoDownloaderAgent:
         self.servers = config.get("servers", ["server1", "server2"])
 
     def _build_url(self, serial_cfg: dict, date_str: str) -> str:
-        if "url_template" in serial_cfg:
-            return serial_cfg["url_template"].replace("{date}", date_str)
-        # Legacy fallback
+        """Build URL from config template, replacing {date} with date_str."""
+        for key in ("player_url", "url_template", "landing_url"):
+            if key in serial_cfg:
+                return serial_cfg[key].replace("{date}", date_str)
         return serial_cfg.get("base_url", "").rstrip("/") + "/" + date_str + "/"
+
+    def _get_player_url(self, serial_cfg: dict, date_str: str) -> Optional[str]:
+        """Get the direct player page URL (tamildhool.li)."""
+        if "player_url" in serial_cfg:
+            return serial_cfg["player_url"].replace("{date}", date_str)
+        return None
+
+    def _get_landing_url(self, serial_cfg: dict, date_str: str) -> Optional[str]:
+        """Get the landing page URL (tamildhool.tech)."""
+        if "landing_url" in serial_cfg:
+            return serial_cfg["landing_url"].replace("{date}", date_str)
+        return None
+
+    def _extract_external_link(self, landing_url: str) -> Optional[str]:
+        """Step 2 fallback: scrape landing page for 'Tap to watch' external link."""
+        logger.info(f"[extract] Looking for external link on: {landing_url}")
+        try:
+            resp = requests.get(landing_url, headers=self.HEADERS, timeout=20)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            # Look for links containing "tap to watch" or external video links
+            for a in soup.find_all("a", href=True):
+                text = a.get_text(strip=True).lower()
+                href = a["href"]
+                if "tap to watch" in text or "external" in text:
+                    logger.info(f"[extract] Found external link: {href}")
+                    return href
+                if "tamildhool.li" in href:
+                    logger.info(f"[extract] Found tamildhool.li link: {href}")
+                    return href
+            # Also check for meta refresh or JS redirects
+            for meta in soup.find_all("meta", attrs={"http-equiv": "refresh"}):
+                content = meta.get("content", "")
+                url_match = re.search(r"url=(.+)", content, re.I)
+                if url_match:
+                    return url_match.group(1).strip()
+            return None
+        except Exception as e:
+            logger.warning(f"[extract] Failed: {e}")
+            return None
 
     def _download_with_ytdlp(self, page_url: str, output_path: str) -> bool:
         logger.info(f"[yt-dlp] Attempting: {page_url}")
@@ -270,6 +311,20 @@ class VideoDownloaderAgent:
             play_sels = [".jw-icon-display", ".vjs-big-play-button", "video",
                          ".play-btn", "#player", ".btn-play",
                          "[class*='play']", "button[aria-label*='Play']"]
+
+            # Tamildhool.li specific: tab buttons to switch player source
+            tab_sels = [
+                "//a[contains(text(),'JW Player')]",
+                "//a[contains(text(),'Thirai One')]",
+                "//a[contains(text(),'Thirai')]",
+                "//button[contains(text(),'JW Player')]",
+                "//button[contains(text(),'Thirai')]",
+                "//li[contains(text(),'JW Player')]",
+                "//li[contains(text(),'Thirai')]",
+                "//*[contains(@class,'tab') and contains(text(),'JW')]",
+                "//*[contains(@class,'tab') and contains(text(),'Thirai')]",
+                "//a[contains(text(),'Tap to watch')]",
+            ]
             try:
                 driver.get(page_url)
                 time.sleep(8)
@@ -282,6 +337,29 @@ class VideoDownloaderAgent:
                 m = _scan()
                 if m:
                     return m
+
+                # Click player tabs (JW Player, Thirai One) on tamildhool.li
+                for xp in tab_sels:
+                    try:
+                        tab = driver.find_element(By.XPATH, xp)
+                        logger.info(f"[sw] Clicking tab: {tab.text}")
+                        try:
+                            del driver.requests
+                        except Exception:
+                            pass
+                        tab.click()
+                        time.sleep(6)
+                        for sel in play_sels:
+                            try:
+                                driver.find_element(By.CSS_SELECTOR, sel).click()
+                                time.sleep(3)
+                            except Exception:
+                                continue
+                        m = _scan()
+                        if m:
+                            return m
+                    except Exception:
+                        continue
 
                 for server in self.servers:
                     xpaths = [
@@ -418,32 +496,240 @@ class VideoDownloaderAgent:
             logger.warning(f"[scrape] Failed: {e}")
             return None
 
+    def _full_selenium_flow(self, landing_url: str) -> Optional[str]:
+        """
+        Full tamildhool download flow via selenium-wire:
+        1. Open landing page (tamildhool.tech)
+        2. Click "Tap to watch" link
+        3. Follow to external video page (random domain with ?video_id=XXX)
+        4. Wait for JW Player to load m3u8
+        5. Return intercepted m3u8 URL
+        """
+        logger.info(f"[selenium] Full flow starting: {landing_url}")
+        try:
+            from seleniumwire import webdriver as sw_webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.common.by import By
+
+            opts = Options()
+            for arg in ["--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
+                        "--disable-gpu", "--window-size=1920,1080",
+                        "--autoplay-policy=no-user-gesture-required",
+                        f"user-agent={UA}"]:
+                opts.add_argument(arg)
+
+            driver = sw_webdriver.Chrome(
+                options=opts,
+                seleniumwire_options={"disable_encoding": True, "suppress_connection_errors": True},
+            )
+            driver.set_page_load_timeout(60)
+
+            def _scan():
+                for req in driver.requests:
+                    if req.response and req.url and ".m3u8" in req.url.lower() and "master" not in req.url.lower():
+                        logger.info(f"[selenium] Found stream m3u8: {req.url}")
+                        return req.url
+                for req in driver.requests:
+                    if req.response and req.url and ".m3u8" in req.url.lower():
+                        logger.info(f"[selenium] Found master m3u8: {req.url}")
+                        return req.url
+                return None
+
+            play_sels = [".jw-icon-display", ".vjs-big-play-button", "video",
+                         ".play-btn", "#player", ".btn-play",
+                         "[class*='play']", "button[aria-label*='Play']"]
+
+            try:
+                # Step 1: Open landing page
+                logger.info(f"[selenium] Step 1: Opening landing page")
+                driver.get(landing_url)
+                time.sleep(5)
+
+                # Step 2: Find and click "Tap to watch" link
+                logger.info(f"[selenium] Step 2: Looking for 'Tap to watch' link")
+                tap_xpaths = [
+                    "//a[contains(text(),'Tap to watch')]",
+                    "//a[contains(text(),'tap to watch')]",
+                    "//a[contains(text(),'Watch')]",
+                    "//a[contains(@href,'video_id')]",
+                    "//a[contains(@class,'watch')]",
+                    "//a[contains(@class,'play')]",
+                    "//a[contains(@class,'external')]",
+                ]
+                external_url = None
+                for xp in tap_xpaths:
+                    try:
+                        link = driver.find_element(By.XPATH, xp)
+                        href = link.get_attribute("href")
+                        if href:
+                            external_url = href
+                            logger.info(f"[selenium] Found external link: {external_url}")
+                            break
+                    except Exception:
+                        continue
+
+                if not external_url:
+                    # Try all <a> tags with external domains
+                    for a in driver.find_elements(By.TAG_NAME, "a"):
+                        try:
+                            href = a.get_attribute("href") or ""
+                            if href and "tamildhool" not in href and "video_id" in href:
+                                external_url = href
+                                logger.info(f"[selenium] Found video_id link: {external_url}")
+                                break
+                            if href and "tamildhool" not in href and href.startswith("http"):
+                                text = a.text.lower()
+                                if any(w in text for w in ["watch", "tap", "play", "video"]):
+                                    external_url = href
+                                    logger.info(f"[selenium] Found watch link: {external_url}")
+                                    break
+                        except Exception:
+                            continue
+
+                if not external_url:
+                    logger.warning("[selenium] No 'Tap to watch' link found on landing page")
+                    return None
+
+                # Step 3: Navigate to external video page
+                logger.info(f"[selenium] Step 3: Opening external page: {external_url}")
+                try:
+                    del driver.requests  # clear requests before navigating
+                except Exception:
+                    pass
+                driver.get(external_url)
+                time.sleep(8)
+
+                # Step 4: Check for m3u8 immediately (some pages auto-play)
+                m = _scan()
+                if m:
+                    return m
+
+                # Step 5: Try clicking play buttons
+                logger.info(f"[selenium] Step 4: Clicking play buttons")
+                for sel in play_sels:
+                    try:
+                        driver.find_element(By.CSS_SELECTOR, sel).click()
+                        time.sleep(3)
+                    except Exception:
+                        continue
+
+                m = _scan()
+                if m:
+                    return m
+
+                # Step 6: Try clicking player tabs (JW Player, Thirai One)
+                tab_xpaths = [
+                    "//a[contains(text(),'JW Player')]",
+                    "//a[contains(text(),'Thirai')]",
+                    "//button[contains(text(),'JW Player')]",
+                    "//*[contains(@class,'tab') and contains(text(),'JW')]",
+                ]
+                for xp in tab_xpaths:
+                    try:
+                        tab = driver.find_element(By.XPATH, xp)
+                        logger.info(f"[selenium] Clicking tab: {tab.text}")
+                        tab.click()
+                        time.sleep(5)
+                        for sel in play_sels:
+                            try:
+                                driver.find_element(By.CSS_SELECTOR, sel).click()
+                                time.sleep(3)
+                            except Exception:
+                                continue
+                        m = _scan()
+                        if m:
+                            return m
+                    except Exception:
+                        continue
+
+                # Step 7: Check iframes on external page
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                logger.info(f"[selenium] Checking {len(iframes)} iframes")
+                for iframe in iframes:
+                    try:
+                        driver.switch_to.frame(iframe)
+                        time.sleep(4)
+                        for sel in play_sels:
+                            try:
+                                driver.find_element(By.CSS_SELECTOR, sel).click()
+                                time.sleep(3)
+                            except Exception:
+                                continue
+                        # Check nested iframes
+                        for ni in driver.find_elements(By.TAG_NAME, "iframe"):
+                            try:
+                                driver.switch_to.frame(ni)
+                                time.sleep(3)
+                                for sel in play_sels:
+                                    try:
+                                        driver.find_element(By.CSS_SELECTOR, sel).click()
+                                        time.sleep(3)
+                                    except Exception:
+                                        continue
+                                driver.switch_to.parent_frame()
+                            except Exception:
+                                driver.switch_to.parent_frame()
+                        m = _scan()
+                        if m:
+                            return m
+                        driver.switch_to.default_content()
+                    except Exception:
+                        driver.switch_to.default_content()
+
+                # Step 8: Final wait and scan
+                time.sleep(10)
+                m = _scan()
+                if m:
+                    return m
+
+                logger.warning("[selenium] No m3u8 found after full flow")
+                # Return the external URL so yt-dlp can try it
+                return f"EXTERNAL:{external_url}"
+
+            finally:
+                driver.quit()
+        except Exception as e:
+            logger.warning(f"[selenium] Full flow failed: {e}")
+            return None
+
     def download_serial(self, serial_cfg: dict, date_str: str) -> VideoResult:
         name = serial_cfg["name"]
-        page_url = self._build_url(serial_cfg, date_str)
         filename = f"{name}_{date_str}.mp4".replace(" ", "_")
         output_path = str(DOWNLOAD_DIR / filename)
-        logger.info(f"Processing: {name} {date_str} -> {page_url}")
+        landing_url = self._build_url(serial_cfg, date_str)
+        logger.info(f"Processing: {name} {date_str} -> {landing_url}")
+
         try:
-            if self._download_with_ytdlp(page_url, output_path):
+            # =============================================================
+            # PRIMARY: Selenium full flow
+            # Landing (tamildhool.tech) -> click "Tap to watch"
+            # -> External page (JW Player) -> intercept m3u8 -> download
+            # =============================================================
+            result_url = self._full_selenium_flow(landing_url)
+
+            if result_url:
+                if result_url.startswith("EXTERNAL:"):
+                    # Selenium found the external page but not the m3u8
+                    # Try yt-dlp on the external URL directly
+                    ext_url = result_url[9:]
+                    logger.info(f"[download] Trying yt-dlp on external: {ext_url}")
+                    if self._download_with_ytdlp(ext_url, output_path):
+                        return VideoResult(name, date_str, "success", file_path=output_path)
+                elif ".m3u8" in result_url:
+                    # Got m3u8 URL - download with ffmpeg then yt-dlp fallback
+                    if self._download_with_ffmpeg(result_url, output_path, referer=landing_url):
+                        return VideoResult(name, date_str, "success", file_path=output_path)
+                    if self._download_with_ytdlp(result_url, output_path):
+                        return VideoResult(name, date_str, "success", file_path=output_path)
+
+            # =============================================================
+            # FALLBACK: Try yt-dlp directly on landing URL
+            # =============================================================
+            if self._download_with_ytdlp(landing_url, output_path):
                 return VideoResult(name, date_str, "success", file_path=output_path)
-            video_url = self._scrape_video_url(page_url)
-            if video_url:
-                if ".m3u8" in video_url:
-                    if self._download_with_ffmpeg(video_url, output_path, referer=page_url):
-                        return VideoResult(name, date_str, "success", file_path=output_path)
-                    if self._download_with_ytdlp(video_url, output_path):
-                        return VideoResult(name, date_str, "success", file_path=output_path)
-                elif self._download_with_ytdlp(video_url, output_path):
-                    return VideoResult(name, date_str, "success", file_path=output_path)
-            m3u8_url = self._try_intercept_m3u8(page_url)
-            if m3u8_url:
-                if self._download_with_ffmpeg(m3u8_url, output_path, referer=page_url):
-                    return VideoResult(name, date_str, "success", file_path=output_path)
-                if self._download_with_ytdlp(m3u8_url, output_path):
-                    return VideoResult(name, date_str, "success", file_path=output_path)
-                return VideoResult(name, date_str, "failed", error="FFmpeg+yt-dlp failed on m3u8")
-            return VideoResult(name, date_str, "failed", error="No m3u8 found (all methods failed)")
+
+            return VideoResult(name, date_str, "failed",
+                               error="No m3u8 found after full selenium flow + yt-dlp fallback")
         except Exception as e:
             logger.exception(f"Video error for {name}")
             return VideoResult(name, date_str, "failed", error=str(e)[:200])
@@ -689,6 +975,210 @@ class DeliveryAgent:
 
 
 # ---------------------------------------------------------------------------
+# AGENT 4: Gold Prediction Agent (Gemini AI)
+# ---------------------------------------------------------------------------
+
+class GoldPredictionAgent:
+    """Uses Gemini AI + current/historical data to predict gold rates."""
+
+    def __init__(self, config: dict):
+        self.config = config
+        self._api_key = os.getenv("GEMINI_API_KEY", "")
+
+    def _get_current_rates(self) -> dict:
+        """Fetch current gold rates for context."""
+        scraper = FinancialScraperAgent(self.config)
+        fin = scraper.run()
+        return {
+            "gold_24k_inr_per_gm": fin.gold_24k,
+            "gold_22k_inr_per_gm": fin.gold_22k,
+            "cad_to_inr": fin.cad_to_inr,
+            "timestamp": fin.timestamp,
+        }
+
+    def _fetch_historical_context(self) -> str:
+        """Scrape IBJA table for recent historical rates."""
+        try:
+            resp = requests.get("https://ibjarates.com/", headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            rows_text = []
+            for table in soup.find_all("table"):
+                for row in table.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) >= 3:
+                        row_data = [c.get_text(strip=True) for c in cells[:7]]
+                        rows_text.append(" | ".join(row_data))
+                if rows_text:
+                    break
+            if rows_text:
+                return "IBJA Recent Rates (Date|999|995|916|750|585|Silver):\n" + "\n".join(rows_text[:10])
+            return ""
+        except Exception as e:
+            logger.warning(f"Historical fetch failed: {e}")
+            return ""
+
+    def predict(self, period: str = "weekly") -> str:
+        """
+        Generate gold price prediction using Gemini AI.
+        period: 'weekly', 'monthly', 'yearly'
+        """
+        if not self._api_key:
+            return "Gold prediction unavailable: GEMINI_API_KEY not set."
+
+        current = self._get_current_rates()
+        historical = self._fetch_historical_context()
+        today = today_edt()
+
+        # Calculate prediction date range
+        from datetime import datetime as dt
+        now = dt.now(timezone(timedelta(hours=-4)))
+        if period == "weekly":
+            end = now + timedelta(days=7)
+            period_label = "1 Week"
+        elif period == "monthly":
+            end = now + timedelta(days=30)
+            period_label = "1 Month"
+        elif period == "yearly":
+            end = now + timedelta(days=365)
+            period_label = "1 Year"
+        else:
+            end = now + timedelta(days=7)
+            period_label = "1 Week"
+
+        start_str = now.strftime("%d-%b-%Y")
+        end_str = end.strftime("%d-%b-%Y")
+
+        prompt = f"""You are an expert gold market analyst. Provide a precise gold price prediction.
+
+CURRENT DATA (as of {current.get('timestamp', today)}):
+- Gold 24K (India, IBJA): {current.get('gold_24k_inr_per_gm', 'N/A')} INR/gram
+- Gold 22K (India, IBJA): {current.get('gold_22k_inr_per_gm', 'N/A')} INR/gram
+- CAD/INR exchange rate: {current.get('cad_to_inr', 'N/A')}
+
+{historical}
+
+TASK: Predict gold prices for the period {start_str} to {end_str} ({period_label}).
+
+Provide predictions for:
+1. INDIA (INR per gram) - 24K and 22K
+2. CANADA (CAD per gram) - 24K
+
+For each, provide:
+- Current price
+- Predicted price (at end of period)
+- Direction (Up/Down/Stable)
+- Predicted % change
+- Key factors driving the prediction
+
+Consider: global economic conditions, USD/INR trends, CAD/INR forex, central bank policies, seasonal demand (festivals, weddings), geopolitical factors, inflation data.
+
+Format your response as a clean WhatsApp-friendly text message (use * for bold).
+Keep it concise but include specific numbers.
+Do NOT use markdown headers or bullet points - use simple lines.
+Add a disclaimer at the end that this is AI-generated analysis, not financial advice."""
+
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self._api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            # Clean any markdown formatting for WhatsApp
+            text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
+            text = text.replace("**", "*")
+            logger.info(f"Gold prediction generated for {period_label}")
+            return text
+        except Exception as e:
+            logger.error(f"Gold prediction failed: {e}")
+            return f"Gold prediction failed: {str(e)[:200]}"
+
+
+# ---------------------------------------------------------------------------
+# Delivery Report Generator
+# ---------------------------------------------------------------------------
+
+def generate_delivery_report() -> str:
+    """Generate a per-target delivery report from the latest report file."""
+    reports_dir = DOWNLOAD_DIR
+    report_files = sorted(reports_dir.glob("report_*.json"), reverse=True)
+
+    if not report_files:
+        return "No delivery reports found. Send *run all* to generate one."
+
+    # Load latest report
+    with open(report_files[0]) as f:
+        data = json.load(f)
+
+    lines = [f"*Delivery Report - {data['date']}*", ""]
+
+    receipts = data.get("delivery_receipts", [])
+    if not receipts:
+        lines.append("No deliveries recorded.")
+        return "\n".join(lines)
+
+    # Group by category
+    categories = {}
+    for r in receipts:
+        cat = r.get("category", "unknown")
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(r)
+
+    cat_labels = {
+        "videos": "Video Downloads",
+        "financial": "Financial Updates",
+        "consolidated_report": "Daily Reports",
+    }
+
+    total_ok = 0
+    total_fail = 0
+
+    for cat, items in categories.items():
+        label = cat_labels.get(cat, cat.title())
+        lines.append(f"*{label}*")
+
+        for r in items:
+            ok = r.get("success", False)
+            icon = "Delivered" if ok else "Failed"
+            name = r.get("label", "Unknown")
+            phone = mask_phone(r.get("phone", ""))
+
+            if ok:
+                total_ok += 1
+            else:
+                total_fail += 1
+
+            lines.append(f"  {icon} -> {name} ({phone})")
+            if r.get("error"):
+                lines.append(f"    Reason: {r['error']}")
+
+        lines.append("")
+
+    # Summary
+    total = total_ok + total_fail
+    lines.append(f"*Summary*: {total_ok}/{total} delivered")
+    if total_fail > 0:
+        lines.append(f"Failed: {total_fail}")
+
+    # Check last N reports for history
+    if len(report_files) > 1:
+        lines.append("")
+        lines.append("*Recent History*")
+        for rf in report_files[:5]:
+            try:
+                with open(rf) as f:
+                    rd = json.load(f)
+                status = rd.get("delivery_status", "unknown")
+                rdate = rd.get("date", rf.stem)
+                lines.append(f"  {rdate}: {status}")
+            except Exception:
+                continue
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # MASTER ORCHESTRATOR
 # ---------------------------------------------------------------------------
 
@@ -698,6 +1188,7 @@ class MasterOrchestrator:
         self.video_agent = VideoDownloaderAgent(self.config)
         self.finance_agent = FinancialScraperAgent(self.config)
         self.delivery_agent = DeliveryAgent(self.config)
+        self.prediction_agent = GoldPredictionAgent(self.config)
         self.reports: list = []
 
     def run_daily(self, date_str: Optional[str] = None) -> DailyReport:

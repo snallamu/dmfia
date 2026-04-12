@@ -1,5 +1,5 @@
 """
-DMFIA Scheduler - APScheduler cron trigger at 04:00 UTC daily
+DMFIA Scheduler - APScheduler cron trigger in EST timezone
 """
 
 import logging
@@ -7,7 +7,6 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from crewai_agents import MasterOrchestrator, load_config
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DMFIA.Scheduler")
 
 
@@ -23,18 +22,19 @@ def daily_job():
 
 if __name__ == "__main__":
     config = load_config()
-    hour, minute = config.get("schedule_utc", "04:00").split(":")
+    schedule_str = config.get("schedule_est", config.get("schedule_utc", "08:00"))
+    hour, minute = schedule_str.split(":")
 
     scheduler = BlockingScheduler()
     scheduler.add_job(
         daily_job,
-        CronTrigger(hour=int(hour), minute=int(minute), timezone="UTC"),
+        CronTrigger(hour=int(hour), minute=int(minute), timezone="US/Eastern"),
         id="dmfia_daily",
         name="DMFIA Daily Run",
         replace_existing=True,
     )
 
-    logger.info(f"Scheduler started. Next run at {hour}:{minute} UTC daily.")
+    logger.info(f"Scheduler started. Next run at {hour}:{minute} EST daily.")
     logger.info("Press Ctrl+C to stop.")
 
     try:
