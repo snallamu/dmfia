@@ -179,7 +179,8 @@ def parse_intent_keywords(message: str) -> dict:
 
 def resolve_date(date_str: str) -> str:
     if not date_str or date_str == "today":
-        return datetime.now().strftime("%d-%m-%Y")
+        from crewai_agents import today_edt
+        return today_edt()
     return date_str
 
 

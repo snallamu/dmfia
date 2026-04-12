@@ -79,6 +79,11 @@ def mask_phone(phone: str) -> str:
     return "****"
 
 
+def today_edt() -> str:
+    """Return todays date in DD-MM-YYYY using EDT (UTC-4) timezone."""
+    return datetime.now(timezone(timedelta(hours=-4))).strftime("%d-%m-%Y")
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -445,7 +450,7 @@ class VideoDownloaderAgent:
 
     def run(self, date_str: Optional[str] = None) -> list:
         if not date_str:
-            date_str = datetime.now().strftime("%d-%m-%Y")
+            date_str = today_edt()
         return [self.download_serial(s, date_str) for s in self.config.get("serials", [])]
 
 
@@ -697,7 +702,7 @@ class MasterOrchestrator:
 
     def run_daily(self, date_str: Optional[str] = None) -> DailyReport:
         if not date_str:
-            date_str = datetime.now().strftime("%d-%m-%Y")
+            date_str = today_edt()
         logger.info(f"=== DMFIA Daily Run: {date_str} ===")
         cleanup_old_downloads()
         report = DailyReport(date=date_str)
