@@ -392,26 +392,99 @@ class VideoDownloaderAgent:
 
         return None
 
+    def _follow_redirects(self, url: str) -> Optional[str]:
+        """Follow redirect chain to get final URL.
+        e.g. teamstoday.com/?video=XXX -> insights.kuchenvietnam.com.vn/?video_id=XXX
+        """
+        logger.info(f"[redirect] Following: {url}")
+        # Method 1: cloudscraper (follows JS redirects too)
+        try:
+            import cloudscraper
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            resp = scraper.get(url, timeout=30, allow_redirects=True)
+            final = resp.url
+            if final != url:
+                logger.info(f"[redirect] cloudscraper -> {final}")
+                return final
+            # Check for meta refresh or JS redirect in body
+            meta = re.search(r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*url=([^"\';\s]+)', resp.text, re.I)
+            if meta:
+                redirect_url = meta.group(1)
+                if not redirect_url.startswith("http"):
+                    from urllib.parse import urljoin
+                    redirect_url = urljoin(final, redirect_url)
+                logger.info(f"[redirect] meta refresh -> {redirect_url}")
+                return redirect_url
+            # Check JS window.location
+            js_redir = re.search(r'window\.location\s*(?:\.href)?\s*=\s*["\']([^"\']+)["\']', resp.text, re.I)
+            if js_redir:
+                redirect_url = js_redir.group(1)
+                if not redirect_url.startswith("http"):
+                    from urllib.parse import urljoin
+                    redirect_url = urljoin(final, redirect_url)
+                logger.info(f"[redirect] JS redirect -> {redirect_url}")
+                return redirect_url
+        except Exception as e:
+            logger.warning(f"[redirect] cloudscraper failed: {e}")
+
+        # Method 2: requests HEAD (fast, follows HTTP 301/302)
+        try:
+            resp = requests.head(url, headers=self.HEADERS, timeout=15,
+                                 allow_redirects=True)
+            if resp.url != url:
+                logger.info(f"[redirect] HEAD -> {resp.url}")
+                return resp.url
+        except Exception as e:
+            logger.warning(f"[redirect] HEAD failed: {e}")
+
+        # Method 3: requests GET
+        try:
+            resp = requests.get(url, headers=self.HEADERS, timeout=20,
+                                allow_redirects=True)
+            if resp.url != url:
+                logger.info(f"[redirect] GET -> {resp.url}")
+                return resp.url
+        except Exception as e:
+            logger.warning(f"[redirect] GET failed: {e}")
+
+        # Method 4: curl -L
+        try:
+            result = subprocess.run(
+                ["curl", "-sL", "-o", "/dev/null", "-w", "%{url_effective}",
+                 "-A", UA, "--max-time", "20", url],
+                capture_output=True, text=True, timeout=25
+            )
+            if result.returncode == 0 and result.stdout.strip() != url:
+                final = result.stdout.strip()
+                logger.info(f"[redirect] curl -> {final}")
+                return final
+        except Exception as e:
+            logger.warning(f"[redirect] curl failed: {e}")
+
+        return url
+
     # ----- Step 2: Extract "Tap to watch" link -----
 
     def _find_external_url(self, html: str, landing_url: str) -> Optional[str]:
         """Parse landing page for the external video link."""
-        logger.info("[extract] Looking for 'Tap to watch' link")
+        logger.info("[extract] Looking for video link")
         soup = BeautifulSoup(html, "lxml")
 
-        # Pattern 1: <a> with "Tap to watch" text
+        # Pattern 1: <a> with "Tap to watch" text (partial match, handles em dash)
         for a in soup.find_all("a", href=True):
             text = a.get_text(strip=True).lower()
             href = a["href"]
-            if any(w in text for w in ["tap to watch", "watch now", "play video"]):
+            if "tap to watch" in text or "opens external" in text:
                 logger.info(f"[extract] Found 'tap to watch': {href}")
                 return href
 
-        # Pattern 2: <a> with video_id parameter
+        # Pattern 2: <a> with video or video_id parameter
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if "video_id" in href and href.startswith("http"):
-                logger.info(f"[extract] Found video_id link: {href}")
+            if href.startswith("http") and ("video_id=" in href or "?video=" in href):
+                logger.info(f"[extract] Found video param link: {href}")
                 return href
 
         # Pattern 3: External links (not same domain)
@@ -423,15 +496,20 @@ class VideoDownloaderAgent:
                 link_domain = urlparse(href).netloc
                 if link_domain and link_domain != landing_domain:
                     text = a.get_text(strip=True).lower()
-                    if any(w in text for w in ["watch", "tap", "play", "video", "stream"]):
+                    if any(w in text for w in ["watch", "tap", "play", "video", "stream", "external"]):
                         logger.info(f"[extract] Found external link: {href}")
                         return href
 
-        # Pattern 4: Regex in full HTML for video_id URLs
-        matches = re.findall(r'https?://[^\s\'"<>]+\?video_id=[^\s\'"<>]+', html, re.I)
-        if matches:
-            logger.info(f"[extract] Found video_id in HTML: {matches[0]}")
-            return matches[0]
+        # Pattern 4: Regex in full HTML for video URLs
+        for pattern in [
+            r'https?://[^\s\'"<>]+\?video_id=[^\s\'"<>]+',
+            r'https?://[^\s\'"<>]+\?video=[^\s\'"<>]+',
+            r'https?://teamstoday\.com[^\s\'"<>]*',
+        ]:
+            matches = re.findall(pattern, html, re.I)
+            if matches:
+                logger.info(f"[extract] Found via regex: {matches[0]}")
+                return matches[0]
 
         # Pattern 5: tamildhool.li links
         matches = re.findall(r'https?://[^\s\'"<>]*tamildhool\.li[^\s\'"<>]*', html, re.I)
@@ -944,6 +1022,13 @@ class VideoDownloaderAgent:
 
             if external_url:
                 logger.info(f"[phase1] External URL: {external_url}")
+
+                # Follow redirects to get final URL
+                # (teamstoday.com/?video=XXX redirects to actual player page)
+                final_url = self._follow_redirects(external_url)
+                if final_url and final_url != external_url:
+                    logger.info(f"[phase1] Redirected to: {final_url}")
+                    external_url = final_url
 
                 # Step 3: Try yt-dlp directly on external URL
                 if self._download_with_ytdlp(external_url, output_path):
