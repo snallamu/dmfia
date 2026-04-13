@@ -23,12 +23,12 @@ whatsapp_targets:
   videos:
     - phone: "+16473386458"
       label: "Sn (primary)"
-    - phone: "919600194447"
+    - phone: "+919600194447"
       label: "Mom (India)"
   financial:
     - phone: "+16473386458"
       label: "Sn (primary)"
-    - phone: "918223099532"
+    - phone: "+918220395532"
       label: "Priya (India)"
   consolidated_report:
     - phone: "+16473386458"

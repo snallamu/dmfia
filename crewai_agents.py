@@ -319,7 +319,15 @@ class DailyReport:
 # ---------------------------------------------------------------------------
 
 class VideoDownloaderAgent:
-    """Downloads Tamil serial episodes via yt-dlp + selenium-wire fallback."""
+    """Downloads Tamil serial episodes from tamildhool.tech.
+
+    Flow:
+      1. Fetch landing page (cloudscraper bypasses Cloudflare)
+      2. Extract "Tap to watch" external link
+      3. Fetch external page, find JW Player m3u8 URL
+      4. Download with yt-dlp or ffmpeg
+      5. Fallback: selenium-wire full browser flow
+    """
 
     HEADERS = {"User-Agent": UA}
 
@@ -328,51 +336,179 @@ class VideoDownloaderAgent:
         self.servers = config.get("servers", ["server1", "server2"])
 
     def _build_url(self, serial_cfg: dict, date_str: str) -> str:
-        """Build URL from config template, replacing {date} with date_str."""
-        for key in ("player_url", "url_template", "landing_url"):
+        for key in ("landing_url", "player_url", "url_template"):
             if key in serial_cfg:
                 return serial_cfg[key].replace("{date}", date_str)
         return serial_cfg.get("base_url", "").rstrip("/") + "/" + date_str + "/"
 
-    def _get_player_url(self, serial_cfg: dict, date_str: str) -> Optional[str]:
-        """Get the direct player page URL (tamildhool.li)."""
-        if "player_url" in serial_cfg:
-            return serial_cfg["player_url"].replace("{date}", date_str)
-        return None
+    # ----- Step 1: Fetch page (Cloudflare bypass) -----
 
-    def _get_landing_url(self, serial_cfg: dict, date_str: str) -> Optional[str]:
-        """Get the landing page URL (tamildhool.tech)."""
-        if "landing_url" in serial_cfg:
-            return serial_cfg["landing_url"].replace("{date}", date_str)
-        return None
-
-    def _extract_external_link(self, landing_url: str) -> Optional[str]:
-        """Step 2 fallback: scrape landing page for 'Tap to watch' external link."""
-        logger.info(f"[extract] Looking for external link on: {landing_url}")
+    def _fetch_page(self, url: str) -> Optional[str]:
+        """Fetch page HTML using cloudscraper to bypass Cloudflare 403."""
+        logger.info(f"[fetch] {url}")
+        # Try cloudscraper first (handles Cloudflare JS challenges)
         try:
-            resp = requests.get(landing_url, headers=self.HEADERS, timeout=20)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "lxml")
-            # Look for links containing "tap to watch" or external video links
-            for a in soup.find_all("a", href=True):
-                text = a.get_text(strip=True).lower()
-                href = a["href"]
-                if "tap to watch" in text or "external" in text:
-                    logger.info(f"[extract] Found external link: {href}")
-                    return href
-                if "tamildhool.li" in href:
-                    logger.info(f"[extract] Found tamildhool.li link: {href}")
-                    return href
-            # Also check for meta refresh or JS redirects
-            for meta in soup.find_all("meta", attrs={"http-equiv": "refresh"}):
-                content = meta.get("content", "")
-                url_match = re.search(r"url=(.+)", content, re.I)
-                if url_match:
-                    return url_match.group(1).strip()
-            return None
+            import cloudscraper
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            resp = scraper.get(url, timeout=30)
+            if resp.status_code == 200:
+                logger.info(f"[fetch] cloudscraper OK: {len(resp.text)} chars")
+                return resp.text
+            logger.warning(f"[fetch] cloudscraper status {resp.status_code}")
         except Exception as e:
-            logger.warning(f"[extract] Failed: {e}")
-            return None
+            logger.warning(f"[fetch] cloudscraper failed: {e}")
+
+        # Fallback: plain requests with browser headers
+        try:
+            headers = {
+                "User-Agent": UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            }
+            resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+            if resp.status_code == 200:
+                logger.info(f"[fetch] requests OK: {len(resp.text)} chars")
+                return resp.text
+            logger.warning(f"[fetch] requests status {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"[fetch] requests failed: {e}")
+
+        # Fallback: curl subprocess
+        try:
+            result = subprocess.run(
+                ["curl", "-sL", "-A", UA, "--max-time", "30", url],
+                capture_output=True, text=True, timeout=35
+            )
+            if result.returncode == 0 and len(result.stdout) > 500:
+                logger.info(f"[fetch] curl OK: {len(result.stdout)} chars")
+                return result.stdout
+        except Exception as e:
+            logger.warning(f"[fetch] curl failed: {e}")
+
+        return None
+
+    # ----- Step 2: Extract "Tap to watch" link -----
+
+    def _find_external_url(self, html: str, landing_url: str) -> Optional[str]:
+        """Parse landing page for the external video link."""
+        logger.info("[extract] Looking for 'Tap to watch' link")
+        soup = BeautifulSoup(html, "lxml")
+
+        # Pattern 1: <a> with "Tap to watch" text
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(strip=True).lower()
+            href = a["href"]
+            if any(w in text for w in ["tap to watch", "watch now", "play video"]):
+                logger.info(f"[extract] Found 'tap to watch': {href}")
+                return href
+
+        # Pattern 2: <a> with video_id parameter
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "video_id" in href and href.startswith("http"):
+                logger.info(f"[extract] Found video_id link: {href}")
+                return href
+
+        # Pattern 3: External links (not same domain)
+        from urllib.parse import urlparse
+        landing_domain = urlparse(landing_url).netloc
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http"):
+                link_domain = urlparse(href).netloc
+                if link_domain and link_domain != landing_domain:
+                    text = a.get_text(strip=True).lower()
+                    if any(w in text for w in ["watch", "tap", "play", "video", "stream"]):
+                        logger.info(f"[extract] Found external link: {href}")
+                        return href
+
+        # Pattern 4: Regex in full HTML for video_id URLs
+        matches = re.findall(r'https?://[^\s\'"<>]+\?video_id=[^\s\'"<>]+', html, re.I)
+        if matches:
+            logger.info(f"[extract] Found video_id in HTML: {matches[0]}")
+            return matches[0]
+
+        # Pattern 5: tamildhool.li links
+        matches = re.findall(r'https?://[^\s\'"<>]*tamildhool\.li[^\s\'"<>]*', html, re.I)
+        if matches:
+            logger.info(f"[extract] Found tamildhool.li: {matches[0]}")
+            return matches[0]
+
+        logger.warning("[extract] No external video link found")
+        return None
+
+    # ----- Step 3: Extract m3u8 from video page -----
+
+    def _find_m3u8_in_page(self, html: str) -> Optional[str]:
+        """Extract m3u8 URL from page with JW Player or similar."""
+        logger.info(f"[m3u8] Scanning {len(html)} chars for video URLs")
+
+        # Pattern 1: Direct m3u8 URLs anywhere in source
+        m3u8_urls = re.findall(r'https?://[^\s\'"<>\\]+\.m3u8[^\s\'"<>\\]*', html, re.I)
+        if m3u8_urls:
+            # Prefer non-master m3u8
+            for url in m3u8_urls:
+                if "master" not in url.lower():
+                    logger.info(f"[m3u8] Found stream: {url}")
+                    return url
+            logger.info(f"[m3u8] Found master: {m3u8_urls[0]}")
+            return m3u8_urls[0]
+
+        # Pattern 2: JW Player config - file:"..." or source:"..."
+        jw_patterns = [
+            r'file\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'source\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'src\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'"file"\s*:\s*"([^"]+\.m3u8[^"]*)"',
+            r'"source"\s*:\s*"([^"]+\.m3u8[^"]*)"',
+            r'"src"\s*:\s*"([^"]+\.m3u8[^"]*)"',
+            r'data-src\s*=\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+        ]
+        for pat in jw_patterns:
+            match = re.search(pat, html, re.I)
+            if match:
+                url = match.group(1)
+                logger.info(f"[m3u8] Found via JW pattern: {url}")
+                return url
+
+        # Pattern 3: MP4 URLs (fallback)
+        mp4_urls = re.findall(r'https?://[^\s\'"<>\\]+\.mp4[^\s\'"<>\\]*', html, re.I)
+        if mp4_urls:
+            logger.info(f"[m3u8] Found MP4 fallback: {mp4_urls[0]}")
+            return mp4_urls[0]
+
+        # Pattern 4: Check iframes for player URLs
+        soup = BeautifulSoup(html, "lxml")
+        for iframe in soup.find_all("iframe"):
+            src = iframe.get("src", "")
+            if src and src.startswith("http"):
+                logger.info(f"[m3u8] Found iframe player: {src}")
+                # Fetch iframe page
+                iframe_html = self._fetch_page(src)
+                if iframe_html:
+                    # Recursive search in iframe content
+                    m3u8_in_iframe = re.findall(
+                        r'https?://[^\s\'"<>\\]+\.m3u8[^\s\'"<>\\]*', iframe_html, re.I
+                    )
+                    if m3u8_in_iframe:
+                        logger.info(f"[m3u8] Found in iframe: {m3u8_in_iframe[0]}")
+                        return m3u8_in_iframe[0]
+                    # Check for nested iframes
+                    for pat in jw_patterns:
+                        match = re.search(pat, iframe_html, re.I)
+                        if match:
+                            logger.info(f"[m3u8] Found in iframe JW: {match.group(1)}")
+                            return match.group(1)
+
+        logger.warning("[m3u8] No video URL found in page source")
+        return None
+
+    # ----- Step 4: Download methods -----
 
     def _download_with_ytdlp(self, page_url: str, output_path: str) -> bool:
         logger.info(f"[yt-dlp] Attempting: {page_url}")
@@ -393,180 +529,16 @@ class VideoDownloaderAgent:
                     logger.warning(f"[yt-dlp] File too small ({size_mb:.1f} MB)")
                     Path(output_path).unlink(missing_ok=True)
                     return False
-                logger.info(f"[yt-dlp] Done: {output_path} ({size_mb:.1f} MB)")
+                logger.info(f"[yt-dlp] Done: {size_mb:.1f} MB")
                 return True
             logger.warning(f"[yt-dlp] Failed (rc={result.returncode}): {result.stderr[:300]}")
             return False
         except subprocess.TimeoutExpired:
-            logger.warning("[yt-dlp] Timeout after 600s")
+            logger.warning("[yt-dlp] Timeout 600s")
             return False
         except FileNotFoundError:
-            logger.warning("[yt-dlp] yt-dlp binary not found")
+            logger.warning("[yt-dlp] not found")
             return False
-
-    def _try_intercept_m3u8(self, page_url: str) -> Optional[str]:
-        logger.info(f"[selenium-wire] Intercepting HLS: {page_url}")
-        try:
-            from seleniumwire import webdriver as sw_webdriver
-            from selenium.webdriver.chrome.options import Options
-            from selenium.webdriver.common.by import By
-
-            opts = Options()
-            for arg in ["--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
-                        "--disable-gpu", "--window-size=1920,1080",
-                        "--autoplay-policy=no-user-gesture-required",
-                        f"user-agent={UA}"]:
-                opts.add_argument(arg)
-
-            driver = sw_webdriver.Chrome(
-                options=opts,
-                seleniumwire_options={"disable_encoding": True, "suppress_connection_errors": True},
-            )
-            driver.set_page_load_timeout(60)
-
-            def _scan():
-                for req in driver.requests:
-                    if req.response and req.url and ".m3u8" in req.url.lower() and "master" not in req.url.lower():
-                        logger.info(f"[sw] stream m3u8: {req.url}")
-                        return req.url
-                for req in driver.requests:
-                    if req.response and req.url and ".m3u8" in req.url.lower():
-                        logger.info(f"[sw] master m3u8: {req.url}")
-                        return req.url
-                return None
-
-            play_sels = [".jw-icon-display", ".vjs-big-play-button", "video",
-                         ".play-btn", "#player", ".btn-play",
-                         "[class*='play']", "button[aria-label*='Play']"]
-
-            # Tamildhool.li specific: tab buttons to switch player source
-            tab_sels = [
-                "//a[contains(text(),'JW Player')]",
-                "//a[contains(text(),'Thirai One')]",
-                "//a[contains(text(),'Thirai')]",
-                "//button[contains(text(),'JW Player')]",
-                "//button[contains(text(),'Thirai')]",
-                "//li[contains(text(),'JW Player')]",
-                "//li[contains(text(),'Thirai')]",
-                "//*[contains(@class,'tab') and contains(text(),'JW')]",
-                "//*[contains(@class,'tab') and contains(text(),'Thirai')]",
-                "//a[contains(text(),'Tap to watch')]",
-            ]
-            try:
-                driver.get(page_url)
-                time.sleep(8)
-                for sel in play_sels:
-                    try:
-                        driver.find_element(By.CSS_SELECTOR, sel).click()
-                        time.sleep(2)
-                    except Exception:
-                        continue
-                m = _scan()
-                if m:
-                    return m
-
-                # Click player tabs (JW Player, Thirai One) on tamildhool.li
-                for xp in tab_sels:
-                    try:
-                        tab = driver.find_element(By.XPATH, xp)
-                        logger.info(f"[sw] Clicking tab: {tab.text}")
-                        try:
-                            del driver.requests
-                        except Exception:
-                            pass
-                        tab.click()
-                        time.sleep(6)
-                        for sel in play_sels:
-                            try:
-                                driver.find_element(By.CSS_SELECTOR, sel).click()
-                                time.sleep(3)
-                            except Exception:
-                                continue
-                        m = _scan()
-                        if m:
-                            return m
-                    except Exception:
-                        continue
-
-                for server in self.servers:
-                    xpaths = [
-                        f"//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{server.lower()}')]",
-                        f"//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{server.lower()}')]",
-                        f"//*[contains(@class,'server') and contains(text(),'{server}')]",
-                    ]
-                    for xp in xpaths:
-                        try:
-                            btn = driver.find_element(By.XPATH, xp)
-                            try:
-                                del driver.requests
-                            except Exception:
-                                pass
-                            btn.click()
-                            time.sleep(8)
-                            m = _scan()
-                            if m:
-                                return m
-                            break
-                        except Exception:
-                            continue
-
-                iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                logger.info(f"[sw] {len(iframes)} iframes found")
-                for i, iframe in enumerate(iframes):
-                    try:
-                        driver.switch_to.frame(iframe)
-                        time.sleep(3)
-                        for sel in play_sels:
-                            try:
-                                driver.find_element(By.CSS_SELECTOR, sel).click()
-                                time.sleep(3)
-                            except Exception:
-                                continue
-                        nested = driver.find_elements(By.TAG_NAME, "iframe")
-                        for ni in nested:
-                            try:
-                                driver.switch_to.frame(ni)
-                                time.sleep(3)
-                                for sel in play_sels:
-                                    try:
-                                        driver.find_element(By.CSS_SELECTOR, sel).click()
-                                        time.sleep(3)
-                                    except Exception:
-                                        continue
-                                driver.switch_to.parent_frame()
-                            except Exception:
-                                driver.switch_to.parent_frame()
-                        m = _scan()
-                        if m:
-                            return m
-                        driver.switch_to.default_content()
-                    except Exception:
-                        driver.switch_to.default_content()
-
-                time.sleep(10)
-                m = _scan()
-                if m:
-                    return m
-
-                ts_urls = [r.url for r in driver.requests if r.response and r.url and ".ts" in r.url.lower()]
-                if ts_urls:
-                    base = ts_urls[0].rsplit("/", 1)[0]
-                    for sfx in ["/index.m3u8", "/playlist.m3u8", "/chunklist.m3u8"]:
-                        try:
-                            resp = requests.head(base + sfx, timeout=10, headers=self.HEADERS)
-                            if resp.status_code == 200:
-                                logger.info(f"[sw] Reconstructed: {base + sfx}")
-                                return base + sfx
-                        except Exception:
-                            continue
-
-                logger.warning("[sw] No m3u8 found")
-                return None
-            finally:
-                driver.quit()
-        except Exception as e:
-            logger.warning(f"[sw] Failed: {e}")
-            return None
 
     def _download_with_ffmpeg(self, m3u8_url: str, output_path: str, referer: str = "") -> bool:
         logger.info(f"[ffmpeg] HLS -> {output_path}")
@@ -595,44 +567,53 @@ class VideoDownloaderAgent:
             logger.error("[ffmpeg] not found")
             return False
 
-    def _scrape_video_url(self, page_url: str) -> Optional[str]:
-        logger.info(f"[scrape] Checking: {page_url}")
+    def _download_direct(self, url: str, output_path: str) -> bool:
+        """Download a direct video URL (MP4/FLV) using wget or requests."""
+        logger.info(f"[direct] Downloading: {url}")
+        # Try wget first (handles redirects, resume)
         try:
-            resp = requests.get(page_url, headers=self.HEADERS, timeout=20)
-            resp.raise_for_status()
-            html = resp.text
-            m3u8s = re.findall(r'https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*', html, re.I)
-            if m3u8s:
-                return m3u8s[0]
-            mp4s = re.findall(r'https?://[^\s\'"<>]+\.mp4[^\s\'"<>]*', html, re.I)
-            if mp4s:
-                return mp4s[0]
-            soup = BeautifulSoup(html, "lxml")
-            for iframe in soup.find_all("iframe"):
-                src = iframe.get("src", "")
-                if src and ("player" in src.lower() or "embed" in src.lower()):
-                    try:
-                        ir = requests.get(src, headers=self.HEADERS, timeout=15)
-                        im = re.findall(r'https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*', ir.text, re.I)
-                        if im:
-                            return im[0]
-                    except Exception:
-                        pass
-            return None
+            result = subprocess.run(
+                ["wget", "-q", "-O", output_path, "--timeout=60",
+                 "--user-agent", UA, url],
+                capture_output=True, text=True, timeout=900
+            )
+            if result.returncode == 0 and Path(output_path).exists():
+                sz = Path(output_path).stat().st_size / (1024 * 1024)
+                if sz >= 1:
+                    logger.info(f"[direct] wget done: {sz:.1f} MB")
+                    return True
+                Path(output_path).unlink(missing_ok=True)
         except Exception as e:
-            logger.warning(f"[scrape] Failed: {e}")
-            return None
+            logger.warning(f"[direct] wget failed: {e}")
 
-    def _full_selenium_flow(self, landing_url: str) -> Optional[str]:
-        """
-        Full tamildhool download flow via selenium-wire:
+        # Fallback: requests streaming download
+        try:
+            resp = requests.get(url, headers=self.HEADERS, timeout=120, stream=True)
+            resp.raise_for_status()
+            with open(output_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            sz = Path(output_path).stat().st_size / (1024 * 1024)
+            if sz >= 1:
+                logger.info(f"[direct] requests done: {sz:.1f} MB")
+                return True
+            Path(output_path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"[direct] requests failed: {e}")
+
+        return False
+
+    # ----- Step 5: Selenium fallback -----
+
+    def _selenium_full_flow(self, landing_url: str) -> Optional[str]:
+        """Phase 3: Full headless Chrome flow.
         1. Open landing page (tamildhool.tech)
-        2. Click "Tap to watch" link
-        3. Follow to external video page (random domain with ?video_id=XXX)
-        4. Wait for JW Player to load m3u8
-        5. Return intercepted m3u8 URL
+        2. Click 'Tap to watch' -> navigates to NEW random external URL
+        3. On external page: intercept HLS (.m3u8), MP4, .ts from network
+        4. Return discovered video URL
         """
-        logger.info(f"[selenium] Full flow starting: {landing_url}")
+        logger.info(f"[selenium] Phase 3: Full browser flow")
+        logger.info(f"[selenium] Landing: {landing_url}")
         try:
             from seleniumwire import webdriver as sw_webdriver
             from selenium.webdriver.chrome.options import Options
@@ -651,110 +632,211 @@ class VideoDownloaderAgent:
             )
             driver.set_page_load_timeout(60)
 
-            def _scan():
+            def _scan_all_video():
+                """Scan network requests for ANY video format: m3u8, mp4, ts."""
+                m3u8_stream = None
+                m3u8_master = None
+                mp4_url = None
+                ts_urls = []
+
                 for req in driver.requests:
-                    if req.response and req.url and ".m3u8" in req.url.lower() and "master" not in req.url.lower():
-                        logger.info(f"[selenium] Found stream m3u8: {req.url}")
-                        return req.url
-                for req in driver.requests:
-                    if req.response and req.url and ".m3u8" in req.url.lower():
-                        logger.info(f"[selenium] Found master m3u8: {req.url}")
-                        return req.url
+                    if not req.response or not req.url:
+                        continue
+                    url = req.url
+                    url_lower = url.lower()
+                    content_type = ""
+                    if req.response.headers:
+                        content_type = req.response.headers.get("Content-Type", "").lower()
+
+                    # m3u8 streams
+                    if ".m3u8" in url_lower:
+                        if "master" in url_lower:
+                            m3u8_master = url
+                        else:
+                            m3u8_stream = url
+
+                    # MP4 files (check URL and content-type)
+                    elif ".mp4" in url_lower and "image" not in url_lower:
+                        if req.response.status_code == 200:
+                            mp4_url = url
+                    elif "video/mp4" in content_type or "video/x-flv" in content_type:
+                        mp4_url = url
+
+                    # HLS .ts segments
+                    elif ".ts" in url_lower and "fonts" not in url_lower and "analytics" not in url_lower:
+                        ts_urls.append(url)
+
+                    # DASH mpd manifests
+                    elif ".mpd" in url_lower:
+                        logger.info(f"[selenium] Found DASH mpd: {url}")
+                        return url
+
+                    # application/vnd.apple.mpegurl
+                    elif "mpegurl" in content_type:
+                        m3u8_stream = url
+
+                # Priority: stream m3u8 > master m3u8 > mp4 > reconstruct from .ts
+                if m3u8_stream:
+                    logger.info(f"[selenium] Intercepted m3u8 stream: {m3u8_stream}")
+                    return m3u8_stream
+                if m3u8_master:
+                    logger.info(f"[selenium] Intercepted m3u8 master: {m3u8_master}")
+                    return m3u8_master
+                if mp4_url:
+                    logger.info(f"[selenium] Intercepted MP4: {mp4_url}")
+                    return mp4_url
+                if ts_urls:
+                    # Try to find m3u8 by guessing from .ts base URL
+                    base = ts_urls[0].rsplit("/", 1)[0]
+                    for suffix in ["/index.m3u8", "/playlist.m3u8", "/chunklist.m3u8", "/stream.m3u8"]:
+                        candidate = base + suffix
+                        try:
+                            resp = requests.head(candidate, timeout=10, headers=HEADERS)
+                            if resp.status_code == 200:
+                                logger.info(f"[selenium] Reconstructed m3u8 from .ts: {candidate}")
+                                return candidate
+                        except Exception:
+                            continue
+                    logger.info(f"[selenium] Found {len(ts_urls)} .ts segments but no m3u8")
+
                 return None
 
-            play_sels = [".jw-icon-display", ".vjs-big-play-button", "video",
-                         ".play-btn", "#player", ".btn-play",
-                         "[class*='play']", "button[aria-label*='Play']"]
+            play_sels = [
+                ".jw-icon-display", ".jw-video", ".vjs-big-play-button",
+                "video", ".play-btn", "#player", ".btn-play",
+                "[class*='play']", "button[aria-label*='Play']",
+                ".plyr__control--overlaid",  # Plyr player
+            ]
 
             try:
-                # Step 1: Open landing page
+                # ===== STEP 1: Open landing page =====
                 logger.info(f"[selenium] Step 1: Opening landing page")
                 driver.get(landing_url)
-                time.sleep(5)
+                time.sleep(6)
 
-                # Step 2: Find and click "Tap to watch" link
-                logger.info(f"[selenium] Step 2: Looking for 'Tap to watch' link")
+                # ===== STEP 2: Find "Tap to watch" and get NEW URL =====
+                logger.info(f"[selenium] Step 2: Finding 'Tap to watch' link")
+                external_url = None
+
+                # Try clicking the link directly (this opens new URL in same tab)
                 tap_xpaths = [
                     "//a[contains(text(),'Tap to watch')]",
                     "//a[contains(text(),'tap to watch')]",
                     "//a[contains(text(),'Watch')]",
+                    "//a[contains(text(),'WATCH')]",
                     "//a[contains(@href,'video_id')]",
                     "//a[contains(@class,'watch')]",
                     "//a[contains(@class,'play')]",
                     "//a[contains(@class,'external')]",
+                    "//a[contains(@class,'btn') and contains(@href,'http')]",
                 ]
-                external_url = None
+
+                # First: try to get href without clicking
                 for xp in tap_xpaths:
                     try:
                         link = driver.find_element(By.XPATH, xp)
                         href = link.get_attribute("href")
-                        if href:
+                        if href and href.startswith("http"):
                             external_url = href
-                            logger.info(f"[selenium] Found external link: {external_url}")
+                            logger.info(f"[selenium] Found link href: {external_url}")
                             break
                     except Exception:
                         continue
 
+                # If no explicit href, scan all <a> for external domains
                 if not external_url:
-                    # Try all <a> tags with external domains
+                    from urllib.parse import urlparse
+                    landing_domain = urlparse(landing_url).netloc
                     for a in driver.find_elements(By.TAG_NAME, "a"):
                         try:
                             href = a.get_attribute("href") or ""
-                            if href and "tamildhool" not in href and "video_id" in href:
-                                external_url = href
-                                logger.info(f"[selenium] Found video_id link: {external_url}")
-                                break
-                            if href and "tamildhool" not in href and href.startswith("http"):
-                                text = a.text.lower()
-                                if any(w in text for w in ["watch", "tap", "play", "video"]):
+                            if not href.startswith("http"):
+                                continue
+                            link_domain = urlparse(href).netloc
+                            if link_domain and link_domain != landing_domain:
+                                text = (a.text or "").lower()
+                                # Prioritize video-related links
+                                if "video_id" in href or any(w in text for w in ["watch", "tap", "play", "video"]):
                                     external_url = href
-                                    logger.info(f"[selenium] Found watch link: {external_url}")
+                                    logger.info(f"[selenium] Found external link: {external_url}")
                                     break
                         except Exception:
                             continue
 
+                # If still nothing, try clicking and see where it goes
                 if not external_url:
-                    logger.warning("[selenium] No 'Tap to watch' link found on landing page")
+                    for xp in tap_xpaths[:3]:
+                        try:
+                            link = driver.find_element(By.XPATH, xp)
+                            try:
+                                del driver.requests
+                            except Exception:
+                                pass
+                            link.click()
+                            time.sleep(5)
+                            # Check if URL changed (navigated to new page)
+                            new_url = driver.current_url
+                            if new_url != landing_url:
+                                external_url = new_url
+                                logger.info(f"[selenium] Clicked through to: {external_url}")
+                            break
+                        except Exception:
+                            continue
+
+                if not external_url:
+                    logger.warning("[selenium] No 'Tap to watch' link found")
                     return None
 
-                # Step 3: Navigate to external video page
-                logger.info(f"[selenium] Step 3: Opening external page: {external_url}")
+                # ===== STEP 3: Navigate to NEW external URL =====
+                logger.info(f"[selenium] Step 3: Opening NEW URL: {external_url}")
                 try:
-                    del driver.requests  # clear requests before navigating
+                    del driver.requests  # Clear all previous network captures
                 except Exception:
                     pass
-                driver.get(external_url)
+
+                # Only navigate if we haven't already clicked through
+                if driver.current_url != external_url:
+                    driver.get(external_url)
                 time.sleep(8)
 
-                # Step 4: Check for m3u8 immediately (some pages auto-play)
-                m = _scan()
-                if m:
-                    return m
+                logger.info(f"[selenium] Current page: {driver.current_url}")
+                logger.info(f"[selenium] Page title: {driver.title}")
 
-                # Step 5: Try clicking play buttons
-                logger.info(f"[selenium] Step 4: Clicking play buttons")
+                # ===== STEP 4: Scan for auto-loaded video =====
+                video_url = _scan_all_video()
+                if video_url:
+                    return video_url
+
+                # ===== STEP 5: Click play buttons on external page =====
+                logger.info(f"[selenium] Step 5: Clicking play buttons")
                 for sel in play_sels:
                     try:
-                        driver.find_element(By.CSS_SELECTOR, sel).click()
-                        time.sleep(3)
+                        el = driver.find_element(By.CSS_SELECTOR, sel)
+                        logger.info(f"[selenium] Clicking: {sel}")
+                        el.click()
+                        time.sleep(4)
+                        video_url = _scan_all_video()
+                        if video_url:
+                            return video_url
                     except Exception:
                         continue
 
-                m = _scan()
-                if m:
-                    return m
-
-                # Step 6: Try clicking player tabs (JW Player, Thirai One)
+                # ===== STEP 6: Click player tabs (JW Player, Thirai One) =====
+                logger.info(f"[selenium] Step 6: Clicking player tabs")
                 tab_xpaths = [
                     "//a[contains(text(),'JW Player')]",
                     "//a[contains(text(),'Thirai')]",
-                    "//button[contains(text(),'JW Player')]",
-                    "//*[contains(@class,'tab') and contains(text(),'JW')]",
+                    "//button[contains(text(),'JW')]",
+                    "//*[contains(@class,'tab')]",
                 ]
                 for xp in tab_xpaths:
                     try:
                         tab = driver.find_element(By.XPATH, xp)
                         logger.info(f"[selenium] Clicking tab: {tab.text}")
+                        try:
+                            del driver.requests
+                        except Exception:
+                            pass
                         tab.click()
                         time.sleep(5)
                         for sel in play_sels:
@@ -763,27 +845,32 @@ class VideoDownloaderAgent:
                                 time.sleep(3)
                             except Exception:
                                 continue
-                        m = _scan()
-                        if m:
-                            return m
+                        video_url = _scan_all_video()
+                        if video_url:
+                            return video_url
                     except Exception:
                         continue
 
-                # Step 7: Check iframes on external page
+                # ===== STEP 7: Check inside iframes =====
                 iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                logger.info(f"[selenium] Checking {len(iframes)} iframes")
-                for iframe in iframes:
+                logger.info(f"[selenium] Step 7: Checking {len(iframes)} iframes")
+                for i, iframe in enumerate(iframes):
                     try:
+                        src = iframe.get_attribute("src") or ""
+                        logger.info(f"[selenium] iframe[{i}]: {src[:80]}")
                         driver.switch_to.frame(iframe)
                         time.sleep(4)
+
                         for sel in play_sels:
                             try:
                                 driver.find_element(By.CSS_SELECTOR, sel).click()
                                 time.sleep(3)
                             except Exception:
                                 continue
-                        # Check nested iframes
-                        for ni in driver.find_elements(By.TAG_NAME, "iframe"):
+
+                        # Check nested iframes (video players often double-iframe)
+                        nested = driver.find_elements(By.TAG_NAME, "iframe")
+                        for ni in nested:
                             try:
                                 driver.switch_to.frame(ni)
                                 time.sleep(3)
@@ -796,75 +883,135 @@ class VideoDownloaderAgent:
                                 driver.switch_to.parent_frame()
                             except Exception:
                                 driver.switch_to.parent_frame()
-                        m = _scan()
-                        if m:
-                            return m
+
+                        video_url = _scan_all_video()
+                        if video_url:
+                            return video_url
                         driver.switch_to.default_content()
                     except Exception:
                         driver.switch_to.default_content()
 
-                # Step 8: Final wait and scan
-                time.sleep(10)
-                m = _scan()
-                if m:
-                    return m
+                # ===== STEP 8: Final wait and scan =====
+                logger.info(f"[selenium] Step 8: Final wait (15s)")
+                time.sleep(15)
+                video_url = _scan_all_video()
+                if video_url:
+                    return video_url
 
-                logger.warning("[selenium] No m3u8 found after full flow")
-                # Return the external URL so yt-dlp can try it
+                # ===== STEP 9: Log all captured URLs for debugging =====
+                logger.warning("[selenium] No video found. Captured URLs:")
+                for req in driver.requests:
+                    if req.response:
+                        ct = req.response.headers.get("Content-Type", "") if req.response.headers else ""
+                        if any(x in ct.lower() for x in ["video", "mpegurl", "octet"]) or \
+                           any(x in req.url.lower() for x in [".m3u8", ".mp4", ".ts", ".mpd", ".flv"]):
+                            logger.warning(f"  {req.response.status_code} {ct[:30]} {req.url[:120]}")
+
+                # Return external URL so yt-dlp can try
                 return f"EXTERNAL:{external_url}"
 
             finally:
                 driver.quit()
         except Exception as e:
-            logger.warning(f"[selenium] Full flow failed: {e}")
+            logger.error(f"[selenium] Phase 3 failed: {e}")
             return None
+
+    # ----- Main download pipeline -----
 
     def download_serial(self, serial_cfg: dict, date_str: str) -> VideoResult:
         name = serial_cfg["name"]
         filename = f"{name}_{date_str}.mp4".replace(" ", "_")
         output_path = str(DOWNLOAD_DIR / filename)
         landing_url = self._build_url(serial_cfg, date_str)
-        logger.info(f"Processing: {name} {date_str} -> {landing_url}")
+
+        logger.info(f"{'='*50}")
+        logger.info(f"DOWNLOAD: {name} | {date_str}")
+        logger.info(f"Landing:  {landing_url}")
+        logger.info(f"{'='*50}")
 
         try:
-            # =============================================================
-            # PRIMARY: Selenium full flow
-            # Landing (tamildhool.tech) -> click "Tap to watch"
-            # -> External page (JW Player) -> intercept m3u8 -> download
-            # =============================================================
-            result_url = self._full_selenium_flow(landing_url)
+            # ===========================================================
+            # PHASE 1: Lightweight approach (cloudscraper + parsing)
+            # ===========================================================
+
+            # Step 1: Fetch landing page
+            landing_html = self._fetch_page(landing_url)
+            external_url = None
+
+            if landing_html:
+                # Step 2: Find "Tap to watch" link
+                external_url = self._find_external_url(landing_html, landing_url)
+
+            if external_url:
+                logger.info(f"[phase1] External URL: {external_url}")
+
+                # Step 3: Try yt-dlp directly on external URL
+                if self._download_with_ytdlp(external_url, output_path):
+                    return VideoResult(name, date_str, "success", file_path=output_path)
+
+                # Step 4: Fetch external page and find m3u8
+                ext_html = self._fetch_page(external_url)
+                if ext_html:
+                    m3u8_url = self._find_m3u8_in_page(ext_html)
+                    if m3u8_url:
+                        logger.info(f"[phase1] m3u8 found: {m3u8_url}")
+                        if self._download_with_ffmpeg(m3u8_url, output_path, referer=external_url):
+                            return VideoResult(name, date_str, "success", file_path=output_path)
+                        if self._download_with_ytdlp(m3u8_url, output_path):
+                            return VideoResult(name, date_str, "success", file_path=output_path)
+
+            # ===========================================================
+            # PHASE 2: Try yt-dlp directly on landing page
+            # ===========================================================
+            logger.info("[phase2] Trying yt-dlp on landing page")
+            if self._download_with_ytdlp(landing_url, output_path):
+                return VideoResult(name, date_str, "success", file_path=output_path)
+
+            # ===========================================================
+            # PHASE 3: Selenium full browser flow (last resort)
+            # Opens landing -> clicks "Tap to watch" -> NEW URL
+            # -> intercepts HLS/MP4/M3U8 from network
+            # ===========================================================
+            logger.info("[phase3] Selenium full browser flow")
+            result_url = self._selenium_full_flow(landing_url)
 
             if result_url:
                 if result_url.startswith("EXTERNAL:"):
-                    # Selenium found the external page but not the m3u8
-                    # Try yt-dlp on the external URL directly
-                    ext_url = result_url[9:]
-                    logger.info(f"[download] Trying yt-dlp on external: {ext_url}")
-                    if self._download_with_ytdlp(ext_url, output_path):
+                    ext = result_url[9:]
+                    logger.info(f"[phase3] Trying yt-dlp on external: {ext}")
+                    if self._download_with_ytdlp(ext, output_path):
                         return VideoResult(name, date_str, "success", file_path=output_path)
-                elif ".m3u8" in result_url:
-                    # Got m3u8 URL - download with ffmpeg then yt-dlp fallback
+                elif ".m3u8" in result_url or ".mpd" in result_url:
+                    logger.info(f"[phase3] HLS/DASH found: {result_url}")
                     if self._download_with_ffmpeg(result_url, output_path, referer=landing_url):
                         return VideoResult(name, date_str, "success", file_path=output_path)
                     if self._download_with_ytdlp(result_url, output_path):
                         return VideoResult(name, date_str, "success", file_path=output_path)
-
-            # =============================================================
-            # FALLBACK: Try yt-dlp directly on landing URL
-            # =============================================================
-            if self._download_with_ytdlp(landing_url, output_path):
-                return VideoResult(name, date_str, "success", file_path=output_path)
+                elif ".mp4" in result_url:
+                    logger.info(f"[phase3] MP4 found: {result_url}")
+                    # Direct MP4: download with yt-dlp (handles redirects/headers)
+                    if self._download_with_ytdlp(result_url, output_path):
+                        return VideoResult(name, date_str, "success", file_path=output_path)
+                    # Or wget/curl fallback
+                    if self._download_direct(result_url, output_path):
+                        return VideoResult(name, date_str, "success", file_path=output_path)
+                else:
+                    # Unknown format, let yt-dlp figure it out
+                    if self._download_with_ytdlp(result_url, output_path):
+                        return VideoResult(name, date_str, "success", file_path=output_path)
 
             return VideoResult(name, date_str, "failed",
-                               error="No m3u8 found after full selenium flow + yt-dlp fallback")
+                               error="All phases failed. Check logs for details.")
+
         except Exception as e:
-            logger.exception(f"Video error for {name}")
+            logger.exception(f"Download crashed for {name}")
             return VideoResult(name, date_str, "failed", error=str(e)[:200])
 
     def run(self, date_str: Optional[str] = None) -> list:
         if not date_str:
             date_str = today_edt()
         return [self.download_serial(s, date_str) for s in self.config.get("serials", [])]
+
 
 
 # ---------------------------------------------------------------------------
