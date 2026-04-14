@@ -100,7 +100,23 @@ def send_whatsapp_reply(to: str, body: str):
         return False
 
 
-# ---------------------------------------------------------------------------
+def send_whatsapp_media(to: str, media_url: str, caption: str = ""):
+    """Send media (image/chart) via Twilio WhatsApp."""
+    if not TWILIO_SID or not TWILIO_TOKEN:
+        logger.error("Twilio credentials not set.")
+        return False
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        kwargs = {"from_": TWILIO_WHATSAPP_FROM, "to": to, "media_url": [media_url]}
+        if caption:
+            kwargs["body"] = caption
+        message = client.messages.create(**kwargs)
+        logger.info(f"Media sent: SID={message.sid} URL={media_url[:60]}")
+        return True
+    except Exception as e:
+        logger.error(f"Twilio media send failed: {e}")
+        return False# ---------------------------------------------------------------------------
 # Intent parsing
 # ---------------------------------------------------------------------------
 

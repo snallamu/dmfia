@@ -704,6 +704,7 @@ class VideoDownloaderAgent:
             driver = webdriver.Firefox(options=ff_opts)
             driver.set_window_size(1936, 1048)
             driver.set_page_load_timeout(60)
+            driver.set_script_timeout(120)  # For batch segment downloads
             logger.info("[selenium] Using Firefox driver")
             return driver
         except Exception as e:
@@ -721,6 +722,7 @@ class VideoDownloaderAgent:
                 cr_opts.add_argument(arg)
             driver = webdriver.Chrome(options=cr_opts)
             driver.set_page_load_timeout(60)
+            driver.set_script_timeout(120)
             logger.info("[selenium] Using Chrome driver")
             return driver
         except Exception as e:
@@ -1027,11 +1029,12 @@ class VideoDownloaderAgent:
                         logger.error("[selenium] No sub-playlists in master manifest")
                         return False
 
-                    # Pick highest quality
-                    sub_playlists.sort(key=lambda x: x[0], reverse=True)
+                    # Pick 360p (good enough, fastest download)
+                    # Sort ascending - pick LOWEST bandwidth for speed
+                    sub_playlists.sort(key=lambda x: x[0])
                     best_url = sub_playlists[0][1]
                     best_bw = sub_playlists[0][0]
-                    logger.info(f"[selenium] Picking quality: {best_bw} bps")
+                    logger.info(f"[selenium] Picking quality: {best_bw} bps (360p - fast download)")
                     logger.info(f"[selenium] Sub-playlist: {best_url[:80]}...")
 
                     # Fetch sub-playlist via browser
@@ -1076,105 +1079,66 @@ class VideoDownloaderAgent:
                     logger.error(f"[selenium] Content: {m3u8_content[:500]}")
                     return False
 
-                # ===== STEP 7: Download segments through browser =====
-                logger.info(f"[selenium] Step 7: Downloading {len(segments)} segments via browser")
+                # ===== STEP 7: Download first segment through browser =====
+                logger.info(f"[selenium] Step 7: Downloading 1 segment ({len(segments)} available)")
                 seg_dir = DOWNLOAD_DIR / "segments"
                 seg_dir.mkdir(parents=True, exist_ok=True)
 
-                # Clean old segments
-                for old in seg_dir.glob("seg_*"):
-                    old.unlink(missing_ok=True)
+                first_url = segments[0]
+                logger.info(f"[selenium] Fetching: {first_url[:80]}...")
 
-                seg_files = []
-                for idx, seg_url in enumerate(segments):
-                    if idx % 20 == 0:
-                        logger.info(f"[selenium] Downloading segment {idx+1}/{len(segments)}")
+                try:
+                    b64_data = driver.execute_async_script("""
+                        var callback = arguments[arguments.length - 1];
+                        fetch(arguments[0]).then(r => {
+                            if (!r.ok) throw new Error('HTTP ' + r.status);
+                            return r.arrayBuffer();
+                        }).then(buf => {
+                            var bytes = new Uint8Array(buf);
+                            var binary = '';
+                            for (var i = 0; i < bytes.length; i += 8192)
+                                binary += String.fromCharCode.apply(null,
+                                    bytes.subarray(i, Math.min(i + 8192, bytes.length)));
+                            callback(btoa(binary));
+                        }).catch(e => callback('ERROR:' + e.message));
+                    """, first_url)
 
-                    # Download as base64 via browser
-                    try:
-                        b64_data = driver.execute_async_script("""
-                            var url = arguments[0];
-                            var callback = arguments[arguments.length - 1];
-                            fetch(url)
-                                .then(r => {
-                                    if (!r.ok) throw new Error('HTTP ' + r.status);
-                                    return r.arrayBuffer();
-                                })
-                                .then(buf => {
-                                    var bytes = new Uint8Array(buf);
-                                    var binary = '';
-                                    var chunk = 8192;
-                                    for (var i = 0; i < bytes.length; i += chunk) {
-                                        binary += String.fromCharCode.apply(null,
-                                            bytes.subarray(i, Math.min(i + chunk, bytes.length)));
-                                    }
-                                    callback(btoa(binary));
-                                })
-                                .catch(e => callback('ERROR:' + e.message));
-                        """, seg_url)
+                    if not b64_data or str(b64_data).startswith("ERROR:"):
+                        logger.error(f"[selenium] Segment failed: {b64_data}")
+                        return False
 
-                        if not b64_data or str(b64_data).startswith("ERROR:"):
-                            logger.warning(f"[selenium] Segment {idx} failed: {b64_data}")
-                            continue
+                    # Save as .ts
+                    ts_path = seg_dir / "seg_00000.ts"
+                    with open(ts_path, "wb") as f:
+                        f.write(base64.b64decode(b64_data))
+                    seg_kb = ts_path.stat().st_size / 1024
+                    logger.info(f"[selenium] Segment downloaded: {seg_kb:.0f} KB")
 
-                        seg_path = seg_dir / f"seg_{idx:05d}.ts"
-                        with open(seg_path, "wb") as f:
-                            f.write(base64.b64decode(b64_data))
-
-                        sz_kb = seg_path.stat().st_size / 1024
-                        if sz_kb < 1:
-                            logger.warning(f"[selenium] Segment {idx} too small ({sz_kb:.0f} KB)")
-                            seg_path.unlink(missing_ok=True)
-                            continue
-
-                        seg_files.append(str(seg_path.resolve()))  # ABSOLUTE path
-
-                    except Exception as e:
-                        logger.warning(f"[selenium] Segment {idx} error: {e}")
-                        continue
-
-                logger.info(f"[selenium] Downloaded {len(seg_files)}/{len(segments)} segments")
-
-                if len(seg_files) < 1:
-                    logger.error("[selenium] No segments downloaded")
+                except Exception as e:
+                    logger.error(f"[selenium] Download error: {e}")
                     return False
 
-                # ===== STEP 8: Concatenate with ffmpeg (local, no network) =====
-                logger.info("[selenium] Step 8: Concatenating with ffmpeg")
-                concat_file = seg_dir / "concat.txt"
-                with open(concat_file, "w") as f:
-                    for sf in seg_files:
-                        # Use absolute path with forward slashes for ffmpeg
-                        abs_path = Path(sf).resolve().as_posix()
-                        f.write(f"file '{abs_path}'\n")
+                # ===== STEP 8: Convert .ts to .mp4 with ffmpeg =====
+                logger.info("[selenium] Step 8: Converting to MP4")
+                ts_abs = str(ts_path.resolve())
+                out_abs = str(Path(output_path).resolve())
 
-                # Use absolute path for concat file too
-                concat_abs = str(concat_file.resolve())
-                output_abs = str(Path(output_path).resolve())
-
-                cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                       "-i", concat_abs,
-                       "-c", "copy", "-movflags", "+faststart",
-                       output_abs]
-                logger.info(f"[selenium] ffmpeg cmd: {' '.join(cmd[:8])}...")
+                cmd = ["ffmpeg", "-y", "-i", ts_abs,
+                       "-c", "copy", "-movflags", "+faststart", out_abs]
                 try:
                     result = subprocess.run(cmd, capture_output=True, text=True,
-                                            timeout=300, errors="replace")
-                    if result.returncode == 0 and Path(output_abs).exists():
-                        sz = Path(output_abs).stat().st_size / (1024 * 1024)
-                        if sz >= 0.5:
-                            logger.info(f"[selenium] SUCCESS: {output_abs} ({sz:.1f} MB)")
-                            # Cleanup segments
-                            for sf in seg_files:
-                                Path(sf).unlink(missing_ok=True)
-                            concat_file.unlink(missing_ok=True)
-                            return True
-                        else:
-                            logger.warning(f"[selenium] File too small: {sz:.1f} MB")
+                                            timeout=60, errors="replace")
+                    if result.returncode == 0 and Path(out_abs).exists():
+                        sz = Path(out_abs).stat().st_size / (1024 * 1024)
+                        logger.info(f"[selenium] SUCCESS: {out_abs} ({sz:.1f} MB)")
+                        ts_path.unlink(missing_ok=True)
+                        return True
                     else:
-                        logger.error(f"[selenium] ffmpeg failed: {result.stderr[-500:]}")
+                        logger.error(f"[selenium] ffmpeg: {result.stderr[-300:]}")
                 except Exception as e:
                     logger.error(f"[selenium] ffmpeg error: {e}")
+
+                return False
 
                 return False
 
