@@ -1,16 +1,25 @@
 FROM python:3.12-slim
 
-# System deps: Chrome, FFmpeg, fonts
+# System deps: Chrome, Firefox, FFmpeg, fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget gnupg2 unzip curl ffmpeg fonts-liberation \
     libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2 \
     libxshmfence1 libx11-xcb1 xdg-utils \
+    firefox-esr \
     && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y /tmp/chrome.deb \
     && rm /tmp/chrome.deb \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Chromedriver
+# Geckodriver (Firefox)
+RUN GECKO_VER=$(curl -sL https://api.github.com/repos/mozilla/geckodriver/releases/latest | grep -oP '"tag_name": "\K[^"]+') \
+    && wget -q "https://github.com/mozilla/geckodriver/releases/download/${GECKO_VER}/geckodriver-${GECKO_VER}-linux64.tar.gz" -O /tmp/gd.tar.gz \
+    && tar xzf /tmp/gd.tar.gz -C /usr/local/bin/ \
+    && chmod +x /usr/local/bin/geckodriver \
+    && rm /tmp/gd.tar.gz \
+    || true
+
+# Chromedriver (Chrome fallback)
 RUN CHROME_VER=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') \
     && wget -q "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VER}.0/linux64/chromedriver-linux64.zip" -O /tmp/cd.zip \
     || wget -q "https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/${CHROME_VER}.0/linux64/chromedriver-linux64.zip" -O /tmp/cd.zip \
