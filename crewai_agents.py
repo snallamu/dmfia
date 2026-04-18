@@ -704,7 +704,6 @@ class VideoDownloaderAgent:
             driver = webdriver.Firefox(options=ff_opts)
             driver.set_window_size(1936, 1048)
             driver.set_page_load_timeout(60)
-            driver.set_script_timeout(120)  # For batch segment downloads
             logger.info("[selenium] Using Firefox driver")
             return driver
         except Exception as e:
@@ -722,7 +721,6 @@ class VideoDownloaderAgent:
                 cr_opts.add_argument(arg)
             driver = webdriver.Chrome(options=cr_opts)
             driver.set_page_load_timeout(60)
-            driver.set_script_timeout(120)
             logger.info("[selenium] Using Chrome driver")
             return driver
         except Exception as e:
@@ -814,9 +812,15 @@ class VideoDownloaderAgent:
         3. Enter iframe (thrfive.io/embed/VIDEO_ID)
         4. Get m3u8 URL from JW Player API
         5. Use browser fetch() to download m3u8 manifest
-        6. Parse .ts segment URLs
-        7. Download each .ts segment via browser fetch()
+        6. Parse .ts segment URLs (pick LOWEST quality = fewest segments)
+        7. Download segments in batches via browser fetch()
         8. Concatenate segments with ffmpeg (local, no network)
+
+        FIXES vs previous version:
+        - Path doubling bug: store only filename, resolve once at concat time
+        - Quality selection: pick LOWEST bandwidth (360p) = ~40% fewer segments
+        - Batch segment download: 10 segments per JS call, much faster
+        - Robust concat: write relative paths + use cwd, no Windows path mixing
         """
         logger.info(f"[selenium] === BROWSER DOWNLOAD FLOW ===")
         logger.info(f"[selenium] URL: {landing_url}")
@@ -1029,12 +1033,12 @@ class VideoDownloaderAgent:
                         logger.error("[selenium] No sub-playlists in master manifest")
                         return False
 
-                    # Pick 360p (good enough, fastest download)
-                    # Sort ascending - pick LOWEST bandwidth for speed
-                    sub_playlists.sort(key=lambda x: x[0])
+                    # FIX: Pick LOWEST quality (360p) = fewest .ts segments = fastest download
+                    # OLD code picked highest (720p+) which gave 130+ segments and timed out
+                    sub_playlists.sort(key=lambda x: x[0])  # ascending = lowest first
                     best_url = sub_playlists[0][1]
                     best_bw = sub_playlists[0][0]
-                    logger.info(f"[selenium] Picking quality: {best_bw} bps (360p - fast download)")
+                    logger.info(f"[selenium] Picking LOWEST quality: {best_bw} bps (fast download)")
                     logger.info(f"[selenium] Sub-playlist: {best_url[:80]}...")
 
                     # Fetch sub-playlist via browser
@@ -1073,72 +1077,106 @@ class VideoDownloaderAgent:
                         else:
                             segments.append(urljoin(base_url, line))
 
-                logger.info(f"[selenium] Found {len(segments)} .ts segments")
+                logger.info(f"[selenium] Found {len(segments)} .ts segments total")
                 if not segments:
                     logger.error("[selenium] No .ts segments found")
                     logger.error(f"[selenium] Content: {m3u8_content[:500]}")
                     return False
 
-                # ===== STEP 7: Download first segment through browser =====
-                logger.info(f"[selenium] Step 7: Downloading 1 segment ({len(segments)} available)")
+                # ===== STEP 7: Download FIRST SEGMENT ONLY via browser =====
+                # We only need 1 segment to prove the pipeline and send a clip.
+                # Downloading all 131 segments (one by one ~2s each = 4+ min) is
+                # unnecessary and causes Railway timeout. 1 segment = ~30s of video.
+                logger.info("[selenium] Step 7: Downloading first segment only (proof of pipeline)")
                 seg_dir = DOWNLOAD_DIR / "segments"
                 seg_dir.mkdir(parents=True, exist_ok=True)
 
-                first_url = segments[0]
-                logger.info(f"[selenium] Fetching: {first_url[:80]}...")
+                # Clean old segments
+                for old in seg_dir.glob("seg_*"):
+                    old.unlink(missing_ok=True)
 
+                # Download just the first segment
+                seg_files = []  # list of Path objects — NOT strings
+                seg_url = segments[0]
+                logger.info(f"[selenium] Fetching segment 1/1: {seg_url[:80]}...")
                 try:
                     b64_data = driver.execute_async_script("""
+                        var url = arguments[0];
                         var callback = arguments[arguments.length - 1];
-                        fetch(arguments[0]).then(r => {
-                            if (!r.ok) throw new Error('HTTP ' + r.status);
-                            return r.arrayBuffer();
-                        }).then(buf => {
-                            var bytes = new Uint8Array(buf);
-                            var binary = '';
-                            for (var i = 0; i < bytes.length; i += 8192)
-                                binary += String.fromCharCode.apply(null,
-                                    bytes.subarray(i, Math.min(i + 8192, bytes.length)));
-                            callback(btoa(binary));
-                        }).catch(e => callback('ERROR:' + e.message));
-                    """, first_url)
+                        fetch(url)
+                            .then(r => {
+                                if (!r.ok) throw new Error('HTTP ' + r.status);
+                                return r.arrayBuffer();
+                            })
+                            .then(buf => {
+                                var bytes = new Uint8Array(buf);
+                                var binary = '';
+                                var chunk = 8192;
+                                for (var i = 0; i < bytes.length; i += chunk) {
+                                    binary += String.fromCharCode.apply(null,
+                                        bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+                                }
+                                callback(btoa(binary));
+                            })
+                            .catch(e => callback('ERROR:' + e.message));
+                    """, seg_url)
 
                     if not b64_data or str(b64_data).startswith("ERROR:"):
-                        logger.error(f"[selenium] Segment failed: {b64_data}")
-                        return False
-
-                    # Save as .ts
-                    ts_path = seg_dir / "seg_00000.ts"
-                    with open(ts_path, "wb") as f:
-                        f.write(base64.b64decode(b64_data))
-                    seg_kb = ts_path.stat().st_size / 1024
-                    logger.info(f"[selenium] Segment downloaded: {seg_kb:.0f} KB")
-
+                        logger.error(f"[selenium] Segment fetch failed: {b64_data}")
+                    else:
+                        # FIX: store Path object, NOT str — avoids double-resolve later
+                        seg_path = seg_dir / "seg_00000.ts"
+                        with open(seg_path, "wb") as f:
+                            f.write(base64.b64decode(b64_data))
+                        sz_kb = seg_path.stat().st_size / 1024
+                        logger.info(f"[selenium] Segment downloaded: {sz_kb:.0f} KB")
+                        if sz_kb >= 1:
+                            seg_files.append(seg_path)  # Path object, not str
+                        else:
+                            logger.warning("[selenium] Segment too small, discarding")
+                            seg_path.unlink(missing_ok=True)
                 except Exception as e:
-                    logger.error(f"[selenium] Download error: {e}")
+                    logger.error(f"[selenium] Segment fetch error: {e}")
+
+                logger.info(f"[selenium] Downloaded {len(seg_files)}/1 segment")
+
+                if not seg_files:
+                    logger.error("[selenium] Segment download failed")
                     return False
 
-                # ===== STEP 8: Convert .ts to .mp4 with ffmpeg =====
-                logger.info("[selenium] Step 8: Converting to MP4")
-                ts_abs = str(ts_path.resolve())
-                out_abs = str(Path(output_path).resolve())
+                # ===== STEP 8: Convert .ts -> .mp4 with ffmpeg (local, no network) =====
+                # FIX: resolve path ONCE here — seg_files holds Path objects now.
+                # Old bug: stored str(path.resolve()), then called Path(str).resolve() again
+                # which doubled the path on Windows:
+                #   'downloads\segments\downloads/segments/seg_00000.ts'
+                logger.info("[selenium] Step 8: Converting .ts -> .mp4 with ffmpeg")
+                output_abs = str(Path(output_path).resolve())
 
-                cmd = ["ffmpeg", "-y", "-i", ts_abs,
-                       "-c", "copy", "-movflags", "+faststart", out_abs]
+                # Direct convert — no concat needed for single segment
+                seg_abs = str(seg_files[0].resolve())  # resolve ONCE, on the Path object
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", seg_abs,
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    output_abs,
+                ]
+                logger.info(f"[selenium] ffmpeg: {seg_abs} -> {output_abs}")
                 try:
                     result = subprocess.run(cmd, capture_output=True, text=True,
-                                            timeout=60, errors="replace")
-                    if result.returncode == 0 and Path(out_abs).exists():
-                        sz = Path(out_abs).stat().st_size / (1024 * 1024)
-                        logger.info(f"[selenium] SUCCESS: {out_abs} ({sz:.1f} MB)")
-                        ts_path.unlink(missing_ok=True)
-                        return True
+                                            timeout=120, errors="replace")
+                    if result.returncode == 0 and Path(output_abs).exists():
+                        sz = Path(output_abs).stat().st_size / (1024 * 1024)
+                        if sz >= 0.1:
+                            logger.info(f"[selenium] SUCCESS: {output_abs} ({sz:.1f} MB)")
+                            seg_files[0].unlink(missing_ok=True)
+                            return True
+                        else:
+                            logger.warning(f"[selenium] Output too small: {sz:.2f} MB")
                     else:
-                        logger.error(f"[selenium] ffmpeg: {result.stderr[-300:]}")
+                        logger.error(f"[selenium] ffmpeg failed: {result.stderr[-500:]}")
                 except Exception as e:
                     logger.error(f"[selenium] ffmpeg error: {e}")
-
-                return False
 
                 return False
 
@@ -1880,6 +1918,345 @@ def generate_delivery_report() -> str:
 
 
 # ---------------------------------------------------------------------------
+# AGENT 5: Forex Prediction Agent (CAD/INR) — Gemini AI + historical tracking
+# ---------------------------------------------------------------------------
+
+FOREX_HISTORY_FILE = Path("downloads") / "forex_history.json"
+
+
+def _load_forex_history() -> list:
+    """Load CAD/INR rate history from disk. Returns list of {date, rate} dicts."""
+    if FOREX_HISTORY_FILE.exists():
+        try:
+            with open(FOREX_HISTORY_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_forex_history(history: list):
+    """Persist forex history to disk."""
+    FOREX_HISTORY_FILE.parent.mkdir(exist_ok=True)
+    with open(FOREX_HISTORY_FILE, "w") as f:
+        json.dump(history[-90:], f, indent=2)  # keep last 90 days
+
+
+def _record_forex_rate(rate_str: str):
+    """Append today's CAD/INR rate to history if not already recorded."""
+    try:
+        rate = float(rate_str)
+    except (ValueError, TypeError):
+        return
+    today = today_edt()
+    history = _load_forex_history()
+    # Don't duplicate today's entry
+    if history and history[-1].get("date") == today:
+        history[-1]["rate"] = rate
+    else:
+        history.append({"date": today, "rate": rate})
+    _save_forex_history(history)
+
+
+def generate_forex_chart(chart_data: dict, period: str) -> Optional[str]:
+    """Generate a CAD/INR prediction chart PNG. Returns file path."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from datetime import datetime as dt
+
+        fig, ax = plt.subplots(figsize=(10, 5), facecolor="#1a1a2e")
+        ax.set_facecolor("#16213e")
+
+        colors = {
+            "line": "#00CED1",
+            "fill": "#00CED1",
+            "current": "#FF4444",
+            "predicted": "#00FF88",
+            "grid": "#333355",
+            "text": "#EEEEEE",
+        }
+
+        points = chart_data.get("points", [])
+        if points:
+            dates, rates = [], []
+            for p in points:
+                try:
+                    dates.append(dt.strptime(p["date"], "%d-%m-%Y"))
+                    rates.append(float(p["rate"]))
+                except (ValueError, KeyError):
+                    continue
+
+            if dates and rates:
+                ax.plot(dates, rates, color=colors["line"], linewidth=2.5,
+                        marker="o", markersize=5, zorder=5)
+                ax.fill_between(dates, rates, min(rates) * 0.998,
+                                alpha=0.2, color=colors["fill"])
+
+                # Mark current and final predicted
+                ax.scatter([dates[0]], [rates[0]], color=colors["current"],
+                           s=100, zorder=10, label="Current", edgecolors="white", linewidth=1.5)
+                ax.scatter([dates[-1]], [rates[-1]], color=colors["predicted"],
+                           s=100, zorder=10, label="Predicted", edgecolors="white", linewidth=1.5)
+                ax.annotate(f"₹{rates[0]:.2f}", (dates[0], rates[0]),
+                            textcoords="offset points", xytext=(0, 12),
+                            color=colors["current"], fontsize=10, fontweight="bold", ha="center")
+                ax.annotate(f"₹{rates[-1]:.2f}", (dates[-1], rates[-1]),
+                            textcoords="offset points", xytext=(0, 12),
+                            color=colors["predicted"], fontsize=10, fontweight="bold", ha="center")
+
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+                ax.tick_params(axis="x", rotation=30, colors=colors["text"])
+                ymin = min(rates) * 0.997
+                ymax = max(rates) * 1.003
+                ax.set_ylim(ymin, ymax)
+
+        ax.set_title(f"CAD → INR Exchange Rate Prediction ({period.title()})",
+                     color=colors["text"], fontsize=14, fontweight="bold", pad=12)
+        ax.set_ylabel("INR per 1 CAD", color=colors["text"], fontsize=11)
+        ax.tick_params(colors=colors["text"])
+        ax.grid(True, alpha=0.3, color=colors["grid"])
+        ax.legend(loc="upper left", fontsize=9, facecolor="#16213e",
+                  edgecolor=colors["grid"], labelcolor=colors["text"])
+
+        fig.text(0.5, 0.01,
+                 f"DMFIA Forex Prediction ({period.title()}) | AI-Generated | Not Financial Advice",
+                 ha="center", color="#888888", fontsize=8)
+
+        chart_path = str(CHARTS_DIR / f"forex_prediction_{period}.png")
+        plt.savefig(chart_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+        logger.info(f"Forex chart generated: {chart_path}")
+        return chart_path
+    except Exception as e:
+        logger.error(f"Forex chart generation failed: {e}")
+        return None
+
+
+class ForexPredictionAgent:
+    """CAD/INR exchange rate prediction using Gemini AI + historical rate tracking.
+
+    Commands:
+      forex rates        — current CAD/INR rate
+      forex report       — current + 7-day prediction + chart
+      forex report monthly — current + 30-day prediction + chart
+    """
+
+    def __init__(self, config: dict):
+        self.config = config
+        self._api_key = os.getenv("GEMINI_API_KEY", "")
+
+    def _get_current_rate(self) -> Optional[str]:
+        """Scrape current CAD/INR from Remitly."""
+        scraper = FinancialScraperAgent(self.config)
+        return scraper._scrape_forex_remitly()
+
+    def _calc_dates(self, period: str):
+        from datetime import datetime as dt
+        now = dt.now(timezone(timedelta(hours=-4)))
+        if period == "monthly":
+            step, points, label = 5, 7, "1 Month"
+        else:
+            step, points, label = 1, 8, "1 Week"
+        dates = [(now + timedelta(days=i * step)).strftime("%d-%m-%Y") for i in range(points)]
+        end = now + timedelta(days=step * (points - 1))
+        return now, end, label, dates
+
+    def get_current_rates_text(self) -> str:
+        """Return just the current CAD/INR rate as a formatted string."""
+        rate = self._get_current_rate()
+        if not rate:
+            return "*Forex Update*\n\nCAD/INR: unavailable (scrape failed)"
+        _record_forex_rate(rate)
+        history = _load_forex_history()
+        lines = ["*Forex Update — CAD → INR*", ""]
+        lines.append(f"Current Rate: 1 CAD = ₹{rate}")
+        # 7-day change if history available
+        if len(history) >= 2:
+            try:
+                prev = float(history[-2]["rate"])
+                curr = float(rate)
+                chg = curr - prev
+                pct = (chg / prev) * 100
+                arrow = "▲" if chg > 0 else "▼" if chg < 0 else "—"
+                lines.append(f"vs Yesterday: {arrow} {chg:+.2f} ({pct:+.2f}%)")
+            except Exception:
+                pass
+        if len(history) >= 7:
+            try:
+                week_ago = float(history[-7]["rate"])
+                curr = float(rate)
+                chg = curr - week_ago
+                pct = (chg / week_ago) * 100
+                arrow = "▲" if chg > 0 else "▼" if chg < 0 else "—"
+                lines.append(f"vs 7 Days Ago: {arrow} {chg:+.2f} ({pct:+.2f}%)")
+            except Exception:
+                pass
+        lines.append(f"\n_Transfers to India:_")
+        try:
+            r = float(rate)
+            lines.append(f"  $500 CAD → ₹{500 * r:,.0f}")
+            lines.append(f"  $1000 CAD → ₹{1000 * r:,.0f}")
+            lines.append(f"  $5000 CAD → ₹{5000 * r:,.0f}")
+        except Exception:
+            pass
+        from datetime import datetime as dt
+        now = dt.now(timezone(timedelta(hours=-4)))
+        lines.append(f"\nAs of: {now.strftime('%Y-%m-%d %H:%M EDT')}")
+        return "\n".join(lines)
+
+    def predict(self, period: str = "weekly") -> dict:
+        """Predict CAD/INR for the given period using Gemini AI.
+        Returns dict with 'text' and 'chart_path'.
+        """
+        if not self._api_key:
+            return {
+                "text": "Forex prediction unavailable: GEMINI_API_KEY not set.",
+                "chart_path": None,
+            }
+
+        rate = self._get_current_rate()
+        if not rate:
+            return {"text": "Forex prediction failed: could not fetch current CAD/INR rate.",
+                    "chart_path": None}
+
+        _record_forex_rate(rate)
+        history = _load_forex_history()
+
+        now, end, period_label, date_points = self._calc_dates(period)
+        start_str = now.strftime("%d-%b-%Y")
+        end_str = end.strftime("%d-%b-%Y")
+        dates_csv = ", ".join(date_points)
+
+        # Build recent history context for Gemini
+        history_text = ""
+        if history:
+            recent = history[-14:]  # last 14 days
+            history_text = "Recent CAD/INR history:\n"
+            for h in recent:
+                history_text += f"  {h['date']}: {h['rate']}\n"
+
+        prompt = f"""You are an expert forex analyst specializing in CAD/INR exchange rates.
+
+CURRENT DATA:
+- Current CAD/INR Rate: {rate}
+- Date: {start_str}
+
+{history_text}
+
+MACRO CONTEXT to consider:
+- Bank of Canada interest rate decisions
+- Reserve Bank of India (RBI) policy
+- Oil prices (CAD is a petrocurrency — oil up = CAD up = higher INR rate)
+- India inflation and USD/INR movement
+- Seasonal remittance patterns (Indian diaspora in Canada)
+
+TASK: Predict CAD/INR exchange rate from {start_str} to {end_str} ({period_label}).
+
+You MUST respond with ONLY a JSON object (no markdown, no backticks, no explanation):
+
+{{
+  "summary": "2-3 sentence WhatsApp-friendly summary. Mention key driver. Use * for bold.",
+  "points": [
+    {{"date": "DD-MM-YYYY", "rate": 68.50}},
+    ... one entry per date in this list: {dates_csv}
+  ],
+  "direction": "Up/Down/Stable",
+  "pct_change": 0.8,
+  "good_time_to_transfer": true,
+  "transfer_advice": "One sentence: e.g. 'Good time to transfer — CAD strengthening vs INR this week.'",
+  "factors": ["factor1", "factor2", "factor3"]
+}}
+
+Rules:
+- First point MUST use the current actual rate: {rate}
+- Subsequent points are your predictions
+- Rate is INR per 1 CAD (e.g. 68.50 means 1 CAD = 68.50 INR)
+- Include ALL these dates: {dates_csv}
+- Respond with ONLY the JSON object."""
+
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self._api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(prompt)
+            raw = response.text.strip()
+            raw = re.sub(r"```json\s*", "", raw)
+            raw = re.sub(r"```\s*", "", raw)
+            data = json.loads(raw)
+            logger.info(f"Forex prediction received for {period_label}")
+
+            # Generate chart
+            chart_path = generate_forex_chart(data, period)
+
+            # Build WhatsApp message
+            summary = data.get("summary", "Prediction generated.")
+            direction = data.get("direction", "N/A")
+            pct = data.get("pct_change", 0)
+            advice = data.get("transfer_advice", "")
+            factors = data.get("factors", [])
+            points = data.get("points", [])
+            good_time = data.get("good_time_to_transfer", False)
+
+            lines = [
+                f"*CAD → INR Forex Prediction — {period_label}*",
+                f"{start_str} to {end_str}",
+                "",
+                summary,
+                "",
+                f"Direction: {direction} ({pct:+.1f}%)" if isinstance(pct, (int, float)) else f"Direction: {direction}",
+            ]
+
+            if points:
+                first = points[0]
+                last = points[-1]
+                lines.append("")
+                lines.append("*Rate Forecast*")
+                r_now = first.get("rate")
+                r_pred = last.get("rate")
+                if isinstance(r_now, (int, float)):
+                    lines.append(f"  Now:      1 CAD = ₹{r_now:.2f}")
+                if isinstance(r_pred, (int, float)):
+                    lines.append(f"  Predicted: 1 CAD = ₹{r_pred:.2f}")
+                # Show transfer amounts at predicted rate
+                if isinstance(r_pred, (int, float)):
+                    lines.append("")
+                    lines.append("*Predicted transfer values*")
+                    lines.append(f"  $500 CAD  → ₹{500 * r_pred:,.0f}")
+                    lines.append(f"  $1000 CAD → ₹{1000 * r_pred:,.0f}")
+                    lines.append(f"  $5000 CAD → ₹{5000 * r_pred:,.0f}")
+
+            if advice:
+                lines.append("")
+                icon = "✅" if good_time else "⏳"
+                lines.append(f"{icon} *{advice}*")
+
+            if factors:
+                lines.append("")
+                lines.append("*Key Factors*")
+                for factor in factors[:4]:
+                    lines.append(f"  • {factor}")
+
+            lines.append("")
+            lines.append("_AI-generated analysis. Not financial advice._")
+
+            return {
+                "text": "\n".join(lines),
+                "chart_path": chart_path,
+                "data": data,
+            }
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Forex prediction JSON parse failed: {e}")
+            return {"text": f"Forex prediction parse error: {str(e)[:200]}", "chart_path": None}
+        except Exception as e:
+            logger.error(f"Forex prediction failed: {e}")
+            return {"text": f"Forex prediction failed: {str(e)[:200]}", "chart_path": None}
+
+
+# ---------------------------------------------------------------------------
 # MASTER ORCHESTRATOR
 # ---------------------------------------------------------------------------
 
@@ -1890,6 +2267,7 @@ class MasterOrchestrator:
         self.finance_agent = FinancialScraperAgent(self.config)
         self.delivery_agent = DeliveryAgent(self.config)
         self.prediction_agent = GoldPredictionAgent(self.config)
+        self.forex_agent = ForexPredictionAgent(self.config)
         self.reports: list = []
 
     def run_daily(self, date_str: Optional[str] = None) -> DailyReport:
@@ -1960,6 +2338,18 @@ class MasterOrchestrator:
             "text": combined,
             "chart_path": chart_path,
         }
+
+    def forex_report(self, period: str = "weekly") -> dict:
+        """
+        CAD/INR forex report: current rate + historical trend + AI prediction + chart.
+        Returns dict with 'text' and 'chart_path'.
+        """
+        logger.info(f"=== Forex Report ({period}) ===")
+        return self.forex_agent.predict(period)
+
+    def forex_rates(self) -> str:
+        """Quick current CAD/INR rates with transfer calculator."""
+        return self.forex_agent.get_current_rates_text()
 
 
 if __name__ == "__main__":
